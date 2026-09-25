@@ -1,0 +1,1807 @@
+
+
+// ===== FILE: package.json =====
+{
+  "name": "mountain-safe",
+  "version": "1.0.0",
+  "description": "Mountain Safe: PWA и сервер онлайн-групп для безопасности в горах",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "node scripts/gen-sw.js",
+    "start": "node scripts/gen-sw.js && node server.js",
+    "test": "node scripts/gen-sw.js && node --test"
+  }
+}
+
+
+// ===== FILE: server.js =====
+'use strict';
+/* Mountain Safe: статический сервер + API онлайн-групп. Зависимостей нет (Node 18+). */
+const http=require('node:http');
+const fs=require('node:fs');
+const path=require('node:path');
+const crypto=require('node:crypto');
+
+const PORT=+process.env.PORT||3000;
+const ROOT=path.join(__dirname,'public');
+const DATA_FILE=process.env.DATA_FILE||path.join(__dirname,'data','groups.json');
+const TTL_MS=7*24*3600*1000;          // группа удаляется через 7 дней без активности
+const MAX_GROUPS=5000,MAX_MEMBERS=60;
+const STATUSES=['ok','help','emergency'];
+const COMMS=['ok','weak','none'];
+
+/* ---------- хранилище ---------- */
+let groups=new Map();
+try{const raw=JSON.parse(fs.readFileSync(DATA_FILE,'utf8'));groups=new Map(Object.entries(raw))}catch(e){}
+let dirty=false,timer=null;
+function persist(){dirty=true;if(timer)return;timer=setTimeout(()=>{timer=null;if(!dirty)return;dirty=false;try{fs.mkdirSync(path.dirname(DATA_FILE),{recursive:true});const tmp=DATA_FILE+'.tmp';fs.writeFileSync(tmp,JSON.stringify(Object.fromEntries(groups)));fs.renameSync(tmp,DATA_FILE)}catch(e){console.error('persist failed',e.message)}},500)}
+function sweep(){const now=Date.now();for(const [k,g] of groups)if(now-g.touched>TTL_MS)groups.delete(k);persist()}
+const sweepTimer=setInterval(sweep,3600*1000);sweepTimer.unref();
+
+/* ---------- утилиты ---------- */
+const token=()=>crypto.randomBytes(18).toString('base64url');
+const ALPHA='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function newCode(){for(let i=0;i<20;i++){let c='';const b=crypto.randomBytes(6);for(const x of b)c+=ALPHA[x%ALPHA.length];if(!groups.has(c))return c}throw new Error('no code')}
+const clean=(s,n)=>String(s??'').replace(/[\u0000-\u001f<>]/g,'').trim().slice(0,n);
+const num=(v,mn,mx)=>{v=+v;return Number.isFinite(v)&&v>=mn&&v<=mx?v:null};
+const eq=(a,b)=>{a=Buffer.from(String(a));b=Buffer.from(String(b));return a.length===b.length&&crypto.timingSafeEqual(a,b)};
+function send(res,code,obj,extra){const body=obj==null?'':JSON.stringify(obj);res.writeHead(code,Object.assign({'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'},extra));res.end(body)}
+function readBody(req){return new Promise((ok,bad)=>{let n=0,over=false;const ch=[];req.on('data',c=>{if(over)return;n+=c.length;if(n>16384){over=true;ch.length=0;bad(Object.assign(new Error('too large'),{code:413}));return}ch.push(c)});req.on('end',()=>{if(over)return;try{ok(ch.length?JSON.parse(Buffer.concat(ch).toString()):{})}catch(e){bad(Object.assign(new Error('bad json'),{code:400}))}});req.on('error',bad)})}
+
+/* простой лимит запросов на IP */
+const buckets=new Map();
+function limited(ip){const now=Date.now(),b=buckets.get(ip)||{t:now,n:0};if(now-b.t>60000){b.t=now;b.n=0}b.n++;buckets.set(ip,b);if(buckets.size>10000)buckets.clear();return b.n>240}
+
+/* ---------- API ---------- */
+function auth(g,tok){if(!tok)return null;if(eq(tok,g.leaderToken))return{leader:true};const m=g.members.find(m=>eq(tok,m.token));return m?{leader:false,member:m}:null}
+function publicView(g,who){
+  const now=Date.now();
+  return{name:g.name,mode:g.mode,checkinAt:g.checkinAt||0,serverNow:now,you:who.member?who.member.id:g.leaderId,leader:who.leader,
+    members:g.members.map(m=>({id:m.id,name:m.name,level:m.level,isLeader:m.id===g.leaderId,status:m.status,comm:m.comm,reportAt:m.reportAt||0,ackAt:m.ackAt||0,clientTs:m.clientTs||0,note:m.note||'',
+      lat:who.leader||who.member&&who.member.id===m.id?m.lat:null,lon:who.leader||who.member&&who.member.id===m.id?m.lon:null,acc:who.leader?m.acc:null}))}}
+function applyReport(m,r){
+  if(STATUSES.includes(r.status))m.status=r.status;
+  if(COMMS.includes(r.comm))m.comm=r.comm;
+  const lat=num(r.lat,-90,90),lon=num(r.lon,-180,180);
+  if(lat!=null&&lon!=null){m.lat=lat;m.lon=lon;m.acc=num(r.acc,0,100000)}
+  if(typeof r.note==='string')m.note=clean(r.note,120);
+  m.clientTs=num(r.ts,0,4102444800000)||Date.now();m.reportAt=Date.now();if(r.ack===true)m.ackAt=Date.now()}
+
+async function api(req,res,url){
+  const parts=url.pathname.split('/').filter(Boolean); // ['api','groups',code,...]
+  if(parts[1]==='health')return send(res,200,{ok:true,groups:groups.size,now:Date.now()});
+  if(parts[1]!=='groups')return send(res,404,{error:'not found'});
+  if(req.method==='POST'&&parts.length===2){
+    const b=await readBody(req);
+    if(groups.size>=MAX_GROUPS)return send(res,503,{error:'server full'});
+    const name=clean(b.name,40),leader=clean(b.leaderName,40);
+    if(!name||!leader)return send(res,400,{error:'name and leaderName required'});
+    const code=newCode(),g={code,name,mode:['school','family','club'].includes(b.mode)?b.mode:'club',created:Date.now(),touched:Date.now(),checkinAt:0,leaderToken:token(),leaderId:1,nextId:2,
+      members:[{id:1,token:token(),name:leader,level:Math.min(3,Math.max(0,+b.level|0)),status:'ok',comm:'ok',reportAt:Date.now(),clientTs:Date.now()}]};
+    groups.set(code,g);persist();
+    return send(res,201,{code,leaderToken:g.leaderToken,memberId:1,memberToken:g.members[0].token});
+  }
+  const code=String(parts[2]||'').toUpperCase(),g=groups.get(code);
+  if(!g)return send(res,404,{error:'group not found'});
+  const tok=(req.headers.authorization||'').replace(/^Bearer\s+/i,'')||url.searchParams.get('t');
+  if(req.method==='POST'&&parts[3]==='join'){
+    const b=await readBody(req),name=clean(b.name,40);
+    if(!name)return send(res,400,{error:'name required'});
+    if(g.members.length>=MAX_MEMBERS)return send(res,409,{error:'group full'});
+    const m={id:g.nextId++,token:token(),name,level:Math.min(3,Math.max(0,+b.level|0)),status:'ok',comm:'ok',reportAt:Date.now(),clientTs:Date.now()};
+    g.members.push(m);g.touched=Date.now();persist();
+    return send(res,201,{memberId:m.id,memberToken:m.token,name:g.name});
+  }
+  const who=auth(g,tok);
+  if(!who)return send(res,401,{error:'unauthorized'});
+  g.touched=Date.now();
+  if(req.method==='GET'&&parts.length===3)return send(res,200,publicView(g,who));
+  if(req.method==='POST'&&parts[3]==='report'){
+    const b=await readBody(req);
+    const m=who.member||g.members.find(x=>x.id===g.leaderId);
+    const list=Array.isArray(b.reports)?b.reports.slice(-20):[b];
+    for(const r of list)applyReport(m,r||{});
+    persist();return send(res,200,{ok:true,serverNow:Date.now()});
+  }
+  if(req.method==='POST'&&parts[3]==='checkin'){
+    if(!who.leader)return send(res,403,{error:'leader only'});
+    g.checkinAt=Date.now();persist();return send(res,200,{checkinAt:g.checkinAt});
+  }
+  if(req.method==='POST'&&parts[3]==='remove'){
+    if(!who.leader)return send(res,403,{error:'leader only'});
+    const b=await readBody(req),id=+b.memberId;
+    if(id===g.leaderId)return send(res,400,{error:'cannot remove leader'});
+    g.members=g.members.filter(m=>m.id!==id);persist();return send(res,200,{ok:true});
+  }
+  if(req.method==='DELETE'&&parts.length===3){
+    if(!who.leader)return send(res,403,{error:'leader only'});
+    groups.delete(code);persist();return send(res,204,null);
+  }
+  return send(res,404,{error:'not found'});
+}
+
+/* ---------- статика ---------- */
+const MIME={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.json':'application/json','.webmanifest':'application/manifest+json','.png':'image/png','.svg':'image/svg+xml','.woff2':'font/woff2','.ico':'image/x-icon','.gpx':'application/gpx+xml'};
+function serveStatic(req,res,url){
+  let p=decodeURIComponent(url.pathname);if(p.endsWith('/'))p+='index.html';
+  const file=path.normalize(path.join(ROOT,p));
+  if(!file.startsWith(ROOT+path.sep)&&file!==ROOT){res.writeHead(403);return res.end('Forbidden')}
+  fs.stat(file,(err,st)=>{
+    if(err||!st.isFile()){res.writeHead(404,{'Content-Type':'text/plain; charset=utf-8'});return res.end('Not found')}
+    const ext=path.extname(file),h={'Content-Type':MIME[ext]||'application/octet-stream','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Permissions-Policy':'geolocation=(self)'};
+    h['Cache-Control']=(file.endsWith('sw.js')||ext==='.html'||ext==='.webmanifest')?'no-cache':'public, max-age=86400';
+    if(file.endsWith('sw.js'))h['Service-Worker-Allowed']='/';
+    res.writeHead(200,h);if(req.method==='HEAD')return res.end();fs.createReadStream(file).pipe(res)});
+}
+
+const server=http.createServer(async(req,res)=>{
+  const ip=req.headers['x-forwarded-for']?String(req.headers['x-forwarded-for']).split(',')[0].trim():req.socket.remoteAddress;
+  const url=new URL(req.url,'http://x');
+  try{
+    if(url.pathname.startsWith('/api/')){
+      if(limited(ip))return send(res,429,{error:'too many requests'});
+      res.setHeader('Access-Control-Allow-Origin',process.env.CORS_ORIGIN||'');
+      if(req.method==='OPTIONS'){res.writeHead(204,{'Access-Control-Allow-Headers':'Content-Type, Authorization','Access-Control-Allow-Methods':'GET,POST,DELETE'});return res.end()}
+      return await api(req,res,url);
+    }
+    if(req.method!=='GET'&&req.method!=='HEAD'){res.writeHead(405);return res.end()}
+    serveStatic(req,res,url);
+  }catch(e){if(!res.headersSent)send(res,e.code&&e.code<500?e.code:500,{error:e.message||'error'});else res.end()}
+});
+if(require.main===module)server.listen(PORT,()=>console.log('Mountain Safe: http://localhost:'+PORT));
+module.exports={server,groups};
+
+
+// ===== FILE: scripts/gen-sw.js =====
+'use strict';
+/* Пересобирает список файлов и версию кэша в public/sw.js. Запускайте после любых правок в public/. */
+const fs=require('fs'),path=require('path'),crypto=require('crypto');
+const ROOT=path.join(__dirname,'..','public');
+const files=[];
+(function walk(d){for(const f of fs.readdirSync(d)){const p=path.join(d,f);if(fs.statSync(p).isDirectory())walk(p);else{const rel=path.relative(ROOT,p).split(path.sep).join('/');if(rel!=='sw.js')files.push(rel)}}})(ROOT);
+files.sort();
+const h=crypto.createHash('sha1');for(const f of files){h.update(f);h.update(fs.readFileSync(path.join(ROOT,f)))}
+const version='ms-'+h.digest('hex').slice(0,10);
+const swPath=path.join(ROOT,'sw.js');
+let sw=fs.readFileSync(swPath,'utf8');
+sw=sw.replace(/const VERSION='[^']*';/,"const VERSION='"+version+"';").replace(/const SHELL=\[[^\]]*\];/,'const SHELL='+JSON.stringify(['./',...files])+';');
+fs.writeFileSync(swPath,sw);
+console.log('sw.js: '+version+', '+(files.length+1)+' файлов в кэше');
+
+
+// ===== FILE: public/index.html =====
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Mountain Safe</title>
+<meta name="description" content="Безопасность в горах: SOS, Stress Mode, офлайн, группа, Emergency Card.">
+<meta name="theme-color" content="#0f1416">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="css/styles.css">
+<style>html{padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}body{margin:0}[hidden]{display:none!important}</style>
+</head>
+<body>
+
+
+<div class="app" id="app">
+  <aside class="side" id="side"></aside>
+  <div class="main">
+    <header class="top" id="top"></header>
+    <div id="banner"></div>
+    <main id="view" class="view" tabindex="-1"></main>
+    <p class="disc">Mountain Safe помогает принять решение и не заменяет профессиональную медицинскую или спасательную помощь. При угрозе жизни звоните в экстренные службы.</p>
+  </div>
+</div>
+<nav class="tabbar" id="tabbar" aria-label="Основная навигация"></nav>
+<div id="demobar"></div>
+<div id="updatebar"></div>
+<div id="overlay"></div>
+<div id="toast"></div>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script src="vendor/qrcode.js"></script>
+<script src="js/config.js"></script>
+<script src="js/data.js"></script>
+<script src="js/lib.js"></script>
+<script src="js/core.js"></script>
+<script src="js/services.js"></script>
+<script src="js/landing.js"></script>
+<script src="js/views.js"></script>
+</body>
+</html>
+
+
+// ===== FILE: public/manifest.webmanifest =====
+{
+  "name": "Mountain Safe — безопасность в горах",
+  "short_name": "Mountain Safe",
+  "description": "Помощник по безопасности в горах: SOS, Stress Mode, офлайн, группа, Emergency Card.",
+  "lang": "ru",
+  "start_url": "./?source=pwa",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f1416",
+  "theme_color": "#0f1416",
+  "icons": [
+    {"src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+    {"src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ],
+  "shortcuts": [
+    {"name": "SOS", "url": "./?go=sos", "icons": [{"src": "icons/icon-192.png", "sizes": "192x192"}]},
+    {"name": "Emergency Card", "url": "./?go=card", "icons": [{"src": "icons/icon-192.png", "sizes": "192x192"}]}
+  ]
+}
+
+
+// ===== FILE: public/css/styles.css =====
+/* Шрифты Onest, Unbounded, JetBrains Mono подключите через @font-face или Google Fonts */
+
+:root{
+  color-scheme:dark;
+  --bg:#0f1416;--bg2:#151c1f;--card:#1c2528;--card2:#253034;--line:#2e3b3f;
+  --tx:#eef3f0;--tx2:#a9b9b2;--tx3:#7a8c85;
+  --g:#62c48a;--g2:#2f7a55;--gs:rgba(98,196,138,.14);--onG:#06170d;
+  --ok:#4fcf7a;--warn:#f2c14e;--hi:#f28b3c;--crit:#ef4b4b;--sos:#e5383b;
+  --shadow:0 10px 30px rgba(0,0,0,.35);
+  --f-body:'Onest',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  --f-disp:'Unbounded','Onest',system-ui,sans-serif;
+  --f-mono:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){
+  color-scheme:light;
+  --bg:#edf2ee;--bg2:#ffffff;--card:#ffffff;--card2:#e5ede8;--line:#d0dbd4;
+  --tx:#121e18;--tx2:#44564d;--tx3:#687a72;
+  --g:#1c7a4a;--g2:#1c7a4a;--gs:rgba(28,122,74,.10);--onG:#ffffff;
+  --ok:#1b8a48;--warn:#9a6700;--hi:#bf520d;--crit:#c62525;--sos:#d42a2d;
+  --shadow:0 8px 24px rgba(20,40,30,.10);}}
+:root[data-theme="light"]{
+  color-scheme:light;
+  --bg:#edf2ee;--bg2:#ffffff;--card:#ffffff;--card2:#e5ede8;--line:#d0dbd4;
+  --tx:#121e18;--tx2:#44564d;--tx3:#687a72;
+  --g:#1c7a4a;--g2:#1c7a4a;--gs:rgba(28,122,74,.10);--onG:#ffffff;
+  --ok:#1b8a48;--warn:#9a6700;--hi:#bf520d;--crit:#c62525;--sos:#d42a2d;
+  --shadow:0 8px 24px rgba(20,40,30,.10);}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0f1416;--bg2:#151c1f;--card:#1c2528;--card2:#253034;--line:#2e3b3f;
+  --tx:#eef3f0;--tx2:#a9b9b2;--tx3:#7a8c85;
+  --g:#62c48a;--g2:#2f7a55;--gs:rgba(98,196,138,.14);--onG:#06170d;
+  --ok:#4fcf7a;--warn:#f2c14e;--hi:#f28b3c;--crit:#ef4b4b;--sos:#e5383b;
+  --shadow:0 10px 30px rgba(0,0,0,.35);}
+
+*{box-sizing:border-box}
+html,body{height:100%}
+body{background:var(--bg);color:var(--tx);font:15px/1.5 var(--f-body);-webkit-font-smoothing:antialiased;padding-inline:0}
+button{font:inherit;color:inherit;cursor:pointer;border:0;background:none;padding:0}
+input,select,textarea{font:inherit;color:var(--tx);background:var(--bg2);border:1.5px solid var(--line);border-radius:12px;padding:11px 13px;width:100%;min-width:0}
+textarea{resize:vertical;min-height:80px}
+input:focus,select:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:3px solid var(--g);outline-offset:2px}
+a{color:var(--g)}
+h1,h2,h3,h4,p{margin:0}
+h1,h2{font-family:var(--f-disp);font-weight:700;letter-spacing:-.01em;text-wrap:balance;line-height:1.2}
+h1{font-size:clamp(22px,5vw,32px)}h2{font-size:clamp(18px,3.6vw,22px)}h3{font-size:16px;font-weight:700;text-wrap:balance}
+.mono{font-family:var(--f-mono)}
+.ic{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.ic.sm{width:16px;height:16px}.ic.lg{width:30px;height:30px}
+
+/* shell */
+.app{display:grid;grid-template-columns:1fr;min-height:100%}
+.side{display:none}
+.main{min-width:0;padding:0 16px calc(96px + env(safe-area-inset-bottom,0px));max-width:920px;width:100%;margin-inline:auto}
+.top{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);display:flex;align-items:center;gap:8px;padding:10px 0;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:9px;font-family:var(--f-disp);font-weight:700;font-size:15px;margin-right:auto;text-align:left}
+.brand .logo{width:32px;height:32px;border-radius:10px;background:var(--g);color:var(--onG);display:grid;place-items:center}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:7px 12px;border-radius:99px;background:var(--card);border:1px solid var(--line);font-size:12.5px;font-weight:700;letter-spacing:.03em;white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--tx3);flex:none}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.crit{background:var(--crit)}.dot.hi{background:var(--hi)}.dot.off{background:#111;box-shadow:0 0 0 1.5px var(--tx3)}
+.tabbar{position:fixed;left:0;right:0;bottom:0;z-index:30;background:var(--bg2);border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(5,1fr);padding:6px 6px calc(6px + env(safe-area-inset-bottom,0px))}
+.tab{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:11px;font-weight:600;color:var(--tx3);padding:6px 2px;border-radius:12px}
+.tab.on{color:var(--g)}
+.tab.sos{color:#fff;background:var(--sos);margin:-16px 6px 0;border-radius:18px;box-shadow:0 8px 20px rgba(229,56,59,.45);padding-top:10px}
+.tab.sos.on{color:#fff}
+@media(min-width:900px){
+  .app{grid-template-columns:250px 1fr}
+  .side{display:flex;flex-direction:column;gap:2px;position:sticky;top:0;height:100vh;padding:20px 12px;border-right:1px solid var(--line);background:var(--bg2);overflow:auto}
+  .tabbar{display:none}
+  .main{padding-bottom:48px}
+  .top .brand{display:none}
+}
+.nav{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:12px;color:var(--tx2);font-weight:600;text-align:left;width:100%}
+.nav:hover{background:var(--card)}
+.nav.on{background:var(--gs);color:var(--g)}
+.nav.sos{background:var(--sos);color:#fff;margin:6px 0}
+.side .brand{padding:4px 8px 16px}
+.side small{color:var(--tx3);font-size:11px;padding:12px 12px 4px;text-transform:uppercase;letter-spacing:.08em;font-weight:700}
+
+/* blocks */
+.view{display:flex;flex-direction:column;gap:16px;padding-top:8px}
+.head{display:flex;flex-direction:column;gap:6px}
+.head p{color:var(--tx2);max-width:62ch}
+.card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:18px;display:flex;flex-direction:column;gap:12px}
+.card.flat{background:var(--bg2)}
+.grid{display:grid;gap:12px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.row.sp{justify-content:space-between}
+.col{display:flex;flex-direction:column;gap:10px}
+.muted{color:var(--tx2)}.small{font-size:13px}.tiny{font-size:12px;color:var(--tx3)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:13px 18px;border-radius:14px;background:var(--card2);font-weight:700;text-align:center;min-height:48px;border:1px solid var(--line)}
+.btn:hover{filter:brightness(1.1)}
+.btn.pri{background:var(--g);color:var(--onG);border-color:transparent}
+.btn.dng{background:var(--sos);color:#fff;border-color:transparent}
+.btn.ghost{background:none}
+.btn.big{min-height:64px;font-size:18px;border-radius:18px;width:100%}
+.btn.sm{min-height:38px;padding:8px 13px;font-size:13px;border-radius:11px}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.chip{padding:8px 14px;border-radius:99px;background:var(--card);border:1px solid var(--line);font-weight:600;font-size:13.5px;white-space:nowrap}
+.chip.on{background:var(--g);color:var(--onG);border-color:transparent}
+.chips{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px;scrollbar-width:thin}
+.badge{display:inline-block;padding:3px 9px;border-radius:99px;font-size:11px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;background:var(--card2);color:var(--tx2)}
+.badge.demo{background:color-mix(in srgb,var(--warn) 20%,transparent);color:var(--warn)}
+.badge.g{background:var(--gs);color:var(--g)}
+.tone-ok{--t:var(--ok)}.tone-warn{--t:var(--warn)}.tone-hi{--t:var(--hi)}.tone-crit{--t:var(--crit)}
+.risk{border-radius:16px;padding:14px 16px;background:color-mix(in srgb,var(--t) 16%,var(--card));border:1.5px solid var(--t);display:flex;gap:12px;align-items:center}
+.risk b{color:var(--t)}
+.bar{height:12px;background:var(--card2);border-radius:99px;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--g);border-radius:99px;transition:width .35s}
+.warnbox{background:color-mix(in srgb,var(--warn) 14%,var(--card));border:1px solid color-mix(in srgb,var(--warn) 55%,transparent);border-radius:14px;padding:12px 14px;font-size:13.5px}
+.dngbox{background:color-mix(in srgb,var(--crit) 14%,var(--card));border:1px solid color-mix(in srgb,var(--crit) 55%,transparent);border-radius:14px;padding:12px 14px}
+.disc{font-size:12px;color:var(--tx3);text-align:center;padding:8px 0;max-width:70ch;margin-inline:auto}
+
+/* home */
+.hero{position:relative;border-radius:26px;padding:22px;background:
+  linear-gradient(160deg,color-mix(in srgb,var(--g2) 55%,var(--card)) 0%,var(--card) 62%);
+  border:1px solid var(--line);overflow:hidden;display:flex;flex-direction:column;gap:16px}
+.hero svg.peaks{position:absolute;right:-10px;bottom:-4px;width:70%;max-width:420px;opacity:.5;pointer-events:none}
+.hero>*{position:relative}
+.hero .tag{color:var(--tx2);max-width:34ch}
+.sosbtn{position:relative;display:flex;align-items:center;justify-content:center;gap:14px;width:100%;min-height:96px;border-radius:24px;background:var(--sos);color:#fff;font-family:var(--f-disp);font-weight:700;font-size:34px;letter-spacing:.06em;box-shadow:0 12px 30px rgba(229,56,59,.4)}
+.sosbtn::after{content:"";position:absolute;inset:-6px;border-radius:30px;border:2px solid var(--sos);opacity:.0;animation:ring 2.4s infinite}
+@keyframes ring{0%{opacity:.7;transform:scale(.98)}100%{opacity:0;transform:scale(1.06)}}
+@media(prefers-reduced-motion:reduce){.sosbtn::after{animation:none}.bar>i{transition:none}}
+.tile{display:flex;flex-direction:column;gap:10px;align-items:flex-start;text-align:left;padding:16px;border-radius:20px;background:var(--card);border:1px solid var(--line);min-height:112px;width:100%}
+.tile:hover{border-color:var(--g)}
+.tile .ti{width:42px;height:42px;border-radius:13px;background:var(--gs);color:var(--g);display:grid;place-items:center}
+.tile b{font-size:16px}.tile span{font-size:12.5px;color:var(--tx2)}
+.stat{display:flex;flex-direction:column;gap:2px;padding:14px;border-radius:16px;background:var(--bg2);border:1px solid var(--line);text-align:left;width:100%}
+.stat b{font-family:var(--f-disp);font-size:20px}.stat span{font-size:12px;color:var(--tx3);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+
+/* incidents */
+.inc{display:flex;flex-direction:column;gap:6px;align-items:flex-start;text-align:left;padding:16px;border-radius:18px;background:var(--card);border:1.5px solid var(--line);min-height:104px;width:100%}
+.inc:hover{border-color:var(--sos)}
+.inc .em{font-size:30px;line-height:1}
+.inc b{font-size:15.5px;line-height:1.25}
+.steps{display:flex;flex-direction:column;gap:10px;padding:0;margin:0;list-style:none;counter-reset:s}
+.steps li{display:flex;gap:12px;align-items:flex-start;padding:14px;border-radius:16px;background:var(--bg2);border:1px solid var(--line);font-size:16px;font-weight:500;line-height:1.4;counter-increment:s}
+.steps li::before{content:counter(s);flex:none;width:30px;height:30px;border-radius:50%;background:var(--g);color:var(--onG);display:grid;place-items:center;font-weight:800;font-size:14px;font-family:var(--f-mono)}
+.steps li.done{opacity:.5;text-decoration:line-through}
+.steps li.done::before{content:"✓"}
+.steps li.adv::before{background:var(--card2);color:var(--tx)}
+.dont{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:12px;background:color-mix(in srgb,var(--crit) 12%,var(--card));font-size:14px}
+.dont::before{content:"✕";color:var(--crit);font-weight:800}
+.num{font-family:var(--f-mono);font-weight:700}
+.emnum{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:14px;background:var(--bg2);border:1px solid var(--line)}
+.emnum b{font-family:var(--f-mono);font-size:24px;min-width:64px}
+
+/* checklists */
+.chk{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border-radius:14px;background:var(--bg2);border:1.5px solid var(--line);text-align:left;width:100%;min-height:52px}
+.chk .bx{flex:none;width:24px;height:24px;border-radius:8px;border:2px solid var(--tx3);display:grid;place-items:center;color:transparent;margin-top:1px}
+.chk.on{border-color:color-mix(in srgb,var(--g) 60%,var(--line));background:var(--gs)}
+.chk.on .bx{background:var(--g);border-color:var(--g);color:var(--onG)}
+.chk small{display:block;color:var(--tx3);font-size:12.5px}
+.chk.crit:not(.on) .bx{border-color:var(--hi)}
+
+/* stress overlay */
+.ov{position:fixed;inset:0;z-index:100;background:var(--bg);display:flex;flex-direction:column;overflow:auto;padding:calc(14px + env(safe-area-inset-top,0px)) 16px calc(16px + env(safe-area-inset-bottom,0px))}
+.ov .in{width:100%;max-width:640px;margin:0 auto;display:flex;flex-direction:column;gap:16px;flex:1}
+.st-h{font-family:var(--f-disp);font-size:clamp(22px,6vw,30px);font-weight:700;line-height:1.25;text-wrap:balance}
+.st-calm{font-family:var(--f-disp);font-size:13px;letter-spacing:.06em;color:var(--g);font-weight:700}
+.ans{display:grid;gap:12px}
+.ans .btn{min-height:76px;font-size:20px;border-radius:20px}
+.big-step{flex:1;display:flex;flex-direction:column;justify-content:center;gap:14px;padding:6px 0}
+.big-step .t{font-size:clamp(24px,6.5vw,34px);font-weight:700;line-height:1.25;text-wrap:balance}
+.big-step .n{font-family:var(--f-mono);color:var(--g);font-weight:700}
+.sit{white-space:pre-wrap;font-family:var(--f-mono);font-size:13px;line-height:1.55;background:var(--bg2);border:1px solid var(--line);border-radius:14px;padding:14px;overflow-x:auto}
+
+/* rescuer card */
+.rcard{background:#fff;color:#111;border-radius:22px;padding:20px;display:flex;flex-direction:column;gap:14px}
+.rcard .r{display:flex;justify-content:space-between;gap:14px;border-bottom:1px solid #ddd;padding-bottom:8px;align-items:flex-start}
+.rcard .r span{color:#555;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;flex:none}
+.rcard .r b{text-align:right;font-size:18px;overflow-wrap:anywhere}
+.rcard .hd{background:#c62828;color:#fff;margin:-20px -20px 0;padding:14px 20px;border-radius:22px 22px 0 0;font-weight:800;letter-spacing:.06em;font-family:var(--f-disp);font-size:15px}
+.qr svg{width:150px;height:150px;display:block;background:#fff}
+
+/* table-ish */
+.member{display:grid;grid-template-columns:1fr auto;gap:8px 12px;padding:14px;border-radius:16px;background:var(--bg2);border:1px solid var(--line);align-items:center}
+.member .nm{font-weight:700;font-size:16px}
+.memo{display:flex;flex-direction:column;gap:10px}
+details.memo-d{background:var(--card);border:1px solid var(--line);border-radius:18px;overflow:hidden}
+details.memo-d>summary{list-style:none;cursor:pointer;padding:16px;display:flex;justify-content:space-between;gap:10px;align-items:center;font-weight:700}
+details.memo-d>summary::-webkit-details-marker{display:none}
+details.memo-d>summary::after{content:"+";font-size:22px;color:var(--g);font-weight:400}
+details.memo-d[open]>summary::after{content:"–"}
+details.memo-d>div{padding:0 16px 16px;display:flex;flex-direction:column;gap:10px}
+.opt{display:block;width:100%;text-align:left;padding:13px 14px;border-radius:14px;border:1.5px solid var(--line);background:var(--bg2);font-weight:600}
+.opt:hover{border-color:var(--g)}
+.opt.right{border-color:var(--ok);background:color-mix(in srgb,var(--ok) 16%,var(--card))}
+.opt.wrong{border-color:var(--crit);background:color-mix(in srgb,var(--crit) 14%,var(--card))}
+.demo-on .ov{padding-top:calc(120px + env(safe-area-inset-top,0px))}
+.g3s{grid-template-columns:repeat(3,minmax(0,1fr))}
+.g3s .stat{padding:12px 10px}.g3s .stat b{font-size:16px}.g3s .stat span{font-size:10.5px}
+.demo-bar{position:fixed;z-index:150;left:12px;right:12px;top:calc(8px + env(safe-area-inset-top,0px));max-width:600px;margin-inline:auto;background:var(--card2);border:1.5px solid var(--warn);border-radius:16px;padding:10px 12px;display:flex;gap:10px;align-items:center;box-shadow:var(--shadow)}
+.offbanner{background:color-mix(in srgb,var(--crit) 16%,var(--card));border:1px solid var(--crit);border-radius:14px;padding:10px 14px;font-size:13.5px;display:flex;gap:10px;align-items:center}
+.weakbanner{background:color-mix(in srgb,var(--warn) 16%,var(--card));border:1px solid var(--warn);border-radius:14px;padding:10px 14px;font-size:13.5px}
+svg text{fill:var(--tx2);font-family:var(--f-body)}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(150px + env(safe-area-inset-bottom,0px));background:var(--tx);color:var(--bg);padding:10px 16px;border-radius:12px;font-weight:600;z-index:200;font-size:14px;max-width:90%}
+label.f{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:600;color:var(--tx2)}
+input[type=range]{padding:0;accent-color:var(--g);height:28px}
+input[type=checkbox]{width:auto}
+.sect-t{font-size:12px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;color:var(--tx3)}
+.lvlcard{text-align:left;width:100%;padding:18px;border-radius:20px;border:2px solid var(--line);background:var(--card);display:flex;flex-direction:column;gap:8px}
+.lvlcard.on{border-color:var(--g);background:var(--gs)}
+.lvlcard ul{margin:0;padding-left:18px;color:var(--tx2);font-size:13.5px}
+
+/* map & real-data additions */
+.map{height:340px;border-radius:18px;border:1px solid var(--line);overflow:hidden;background:var(--card2);z-index:0}
+.leaflet-container{font-family:var(--f-body)}
+.mk{width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)}
+.badge.live{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
+.hidden-file{position:absolute;left:-9999px;width:1px;height:1px;opacity:0}
+.callrow{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.update-bar{position:fixed;left:12px;right:12px;bottom:calc(84px + env(safe-area-inset-bottom,0px));z-index:70;max-width:520px;margin-inline:auto;background:var(--card2);border:1.5px solid var(--g);border-radius:16px;padding:10px 12px;display:flex;gap:10px;align-items:center;box-shadow:var(--shadow)}
+.code{font-family:var(--f-mono);font-weight:700;font-size:32px;letter-spacing:.18em}
+
+.g3t{grid-template-columns:repeat(2,minmax(0,1fr))}
+@media(min-width:700px){.g3t{grid-template-columns:repeat(3,minmax(0,1fr))}}
+
+/* landing */
+.is-landing .side,.is-landing .tabbar,.is-landing .top{display:none}
+.is-landing .app{grid-template-columns:1fr}
+.is-landing .main{max-width:1080px;padding-bottom:40px}
+.is-landing .disc{display:none}
+.lp{display:flex;flex-direction:column;gap:56px;padding-bottom:24px}
+.lp-nav{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;display:flex;align-items:center;gap:14px;padding:12px 0;background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px)}
+.lp-nav .brand{margin-right:auto}
+.lp-links{display:none;gap:4px}
+.lp-links button{padding:8px 12px;border-radius:10px;color:var(--tx2);font-weight:600}
+.lp-links button:hover{background:var(--card)}
+@media(min-width:760px){.lp-links{display:flex}.lp-nav .brand{margin-right:0}.lp-links{margin-right:auto;margin-left:12px}}
+.lp-hero{position:relative;display:grid;gap:32px;align-items:center;padding:28px 0 8px;overflow:hidden}
+@media(min-width:860px){.lp-hero{grid-template-columns:1.25fr .75fr;padding:56px 0 24px}}
+.lp-contour{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:0}
+.lp-copy,.lp-phone{position:relative;z-index:1}
+.lp-copy{display:flex;flex-direction:column;gap:18px;align-items:flex-start}
+.lp-h1{font-size:clamp(28px,6.4vw,54px);line-height:1.12;max-width:16ch}
+.lp-lead{font-size:clamp(16px,2.4vw,19px);color:var(--tx2);max-width:46ch}
+.btn.big2{min-height:56px;padding:14px 24px;font-size:16px;border-radius:16px}
+.lp-phone{display:flex;justify-content:center}
+.lp-scr{width:min(270px,100%);border-radius:34px;padding:26px 20px;background:var(--card);border:2px solid var(--line);box-shadow:var(--shadow);min-height:380px}
+.lp-step{font-family:var(--f-disp);font-weight:700;font-size:21px;line-height:1.3;margin-top:24px;min-height:110px}
+.lp-btn{background:var(--g);color:var(--onG);border-radius:16px;padding:16px;text-align:center;font-weight:700;margin-top:6px}
+.lp-sec{display:flex;flex-direction:column;gap:16px}
+.lp-p{max-width:62ch}
+.lp-wrap{flex-wrap:wrap;overflow:visible}
+.lp-feat{display:flex;gap:14px;align-items:flex-start;padding:4px}
+.lp-feat .ti{width:44px;height:44px;border-radius:13px;background:var(--gs);color:var(--g);display:grid;place-items:center;flex:none}
+.lp-cta{display:flex;flex-direction:column;gap:20px;align-items:center;text-align:center;padding:40px 20px;border-radius:26px;background:linear-gradient(160deg,color-mix(in srgb,var(--g2) 45%,var(--card)),var(--card))}
+.lp-foot{color:var(--tx3);font-size:12.5px;max-width:70ch;margin-inline:auto;text-align:center}
+.brand{background:none;border:0;color:inherit;cursor:pointer;font-family:var(--f-disp)}
+
+
+// ===== FILE: public/js/config.js =====
+/* demoHost: true только в онлайн-демо на хостинге без сервера (внешние запросы и Service Worker недоступны). */
+window.MS_CONFIG={demoHost:false};
+
+
+// ===== FILE: public/js/lib.js =====
+/* Чистые функции без DOM: используются и в браузере, и в тестах (node --test). */
+(function(root){
+'use strict';
+function wxRisk(w){let s=0,r=[];
+ if(w.wind>=50){s+=3;r.push('Сильный ветер')}else if(w.wind>=30){s+=2;r.push('Ветер усиливается')}else if(w.wind>=20)s+=1;
+ if(w.storm>=60){s+=3;r.push('Высокая вероятность грозы')}else if(w.storm>=30){s+=2;r.push('Возможна гроза')}
+ if(w.rain>=5){s+=2;r.push('Сильные осадки')}else if(w.rain>=1)s+=1;
+ if(w.vis<1){s+=3;r.push('Очень плохая видимость')}else if(w.vis<5){s+=2;r.push('Плохая видимость')}else if(w.vis<10)s+=1;
+ if(w.temp<=0){s+=2;r.push('Мороз, риск переохлаждения')}else if(w.temp<=5){s+=1;r.push('Холодно: риск переохлаждения')}else if(w.temp>=32){s+=2;r.push('Жара, риск перегрева')}else if(w.temp>=28)s+=1;
+ return{s,l:s<=1?0:s<=3?1:s<=5?2:3,r}}
+function routeCalc(r){const h=r.dist/4+r.up/500;const sc=r.dist/8+r.up/500+Math.max(0,r.max-2500)/500;return{h,d:sc<1.5?0:sc<3?1:sc<4.5?2:3}}
+const hm=h=>{const m=Math.round(h*60);return Math.floor(m/60)+' ч '+String(m%60).padStart(2,'0')+' мин'};
+function addTime(t,h){const [a,b]=String(t).split(':').map(Number);let m=((a||0)*60+(b||0)+Math.round(h*60));m=((m%1440)+1440)%1440;return String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0')}
+
+/* координаты */
+const fmtCoord=(lat,lon)=>lat.toFixed(5)+', '+lon.toFixed(5);
+function parseCoord(s){const m=String(s||'').match(/(-?\d{1,3}(?:[.,]\d+)?)[\s,;]+(-?\d{1,3}(?:[.,]\d+)?)/);if(!m)return null;const lat=parseFloat(m[1].replace(',','.')),lon=parseFloat(m[2].replace(',','.'));if(!(Math.abs(lat)<=90&&Math.abs(lon)<=180))return null;return{lat,lon}}
+function haversine(a,b){const R=6371000,t=Math.PI/180,dLa=(b[0]-a[0])*t,dLo=(b[1]-a[1])*t;const x=Math.sin(dLa/2)**2+Math.cos(a[0]*t)*Math.cos(b[0]*t)*Math.sin(dLo/2)**2;return 2*R*Math.asin(Math.sqrt(x))}
+
+/* GPX */
+const unxml=s=>String(s||'').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&amp;/g,'&').trim().slice(0,80);
+function parseGpx(t){const nm=/<name>\s*(?:<!\[CDATA\[)?([^<\]]*)/.exec(t);const pts=[];const re=/<(trkpt|rtept)\b([^>]*?)(?:\/>|>([\s\S]*?)<\/\1>)/g;let m;
+ while((m=re.exec(t))){const la=/lat\s*=\s*["']([-\d.]+)["']/.exec(m[2]),lo=/lon\s*=\s*["']([-\d.]+)["']/.exec(m[2]);if(!la||!lo)continue;const lat=+la[1],lon=+lo[1];if(!(Math.abs(lat)<=90&&Math.abs(lon)<=180))continue;const el=m[3]&&/<ele>\s*([-\d.eE+]+)\s*<\/ele>/.exec(m[3]);pts.push([lat,lon,el?+el[1]:null])}
+ return{name:unxml(nm&&nm[1]),pts}}
+function thin(a,max){if(a.length<=max)return a.slice();const o=[],st=(a.length-1)/(max-1);for(let i=0;i<max;i++)o.push(a[Math.round(i*st)]);return o}
+function trackStats(pts){let d=0,up=0,down=0,max=-Infinity,min=Infinity,ref=null;const el=pts.map(p=>p[2]),has=el.some(v=>v!=null);
+ const sm=el.map((v,i)=>{if(v==null)return null;let s=0,c=0;for(let k=Math.max(0,i-2);k<=Math.min(el.length-1,i+2);k++)if(el[k]!=null){s+=el[k];c++}return s/c});
+ const prof=[];
+ for(let i=0;i<pts.length;i++){if(i>0)d+=haversine(pts[i-1],pts[i]);const e=sm[i];
+  if(e!=null){max=Math.max(max,e);min=Math.min(min,e);if(ref==null)ref=e;else if(e-ref>=3){up+=e-ref;ref=e}else if(ref-e>=3){down+=ref-e;ref=e}}
+  prof.push([d/1000,e])}
+ return{dist:Math.round(d/100)/10,up:Math.round(up),down:Math.round(down),max:has?Math.round(max):null,min:has?Math.round(min):null,hasEle:has,profile:thin(prof,120)}}
+function nearestKm(pts,lat,lon){let d=0,best=Infinity,bk=0;for(let i=0;i<pts.length;i++){if(i>0)d+=haversine(pts[i-1],pts[i]);const dd=haversine(pts[i],[lat,lon]);if(dd<best){best=dd;bk=d/1000}}return{km:Math.round(bk*10)/10,off:Math.round(best)}}
+
+/* Open-Meteo → внутренняя модель */
+function stormProb(code,cape){let p=5;if(code>=95)p=85;else if(code>=80&&code<=82)p=20;if(cape!=null){if(cape>=2000)p=Math.max(p,60);else if(cape>=1000)p=Math.max(p,40);else if(cape>=500)p=Math.max(p,20)}return p}
+function openMeteoToWx(j){const c=j.current||{},h=j.hourly||{},tt=h.time||[],hourly=[];
+ for(let i=0;i<Math.min(tt.length,6);i++){const vis=h.visibility&&h.visibility[i]!=null?h.visibility[i]/1000:30;hourly.push({h:+String(tt[i]).slice(11,13),w:{temp:Math.round(h.temperature_2m[i]),wind:Math.round(h.wind_speed_10m[i]),rain:h.precipitation?h.precipitation[i]||0:0,vis:Math.min(30,vis),storm:stormProb(h.weather_code&&h.weather_code[i],h.cape&&h.cape[i])}})}
+ const f=hourly[0]?hourly[0].w:{vis:30,storm:5};
+ return{elev:j.elevation,code:c.weather_code,cur:{temp:Math.round(c.temperature_2m),wind:Math.round(c.wind_speed_10m),rain:c.precipitation||0,vis:f.vis,storm:stormProb(c.weather_code,h.cape&&h.cape[0])},hourly}}
+
+const api={wxRisk,routeCalc,hm,addTime,fmtCoord,parseCoord,haversine,parseGpx,thin,trackStats,nearestKm,stormProb,openMeteoToWx};
+if(typeof module!=='undefined'&&module.exports)module.exports=api;else Object.assign(root,api);
+})(typeof window!=='undefined'?window:globalThis);
+
+
+// ===== FILE: public/js/data.js =====
+/* ================= DATA ================= */
+/* Контент первой помощи — краткие общие рекомендации по мотивам руководств Красного Креста / Wilderness Medical Society.
+   Это справочный прототип: перед боевым применением содержание должен проверить медицинский эксперт / спасательная служба. */
+
+const LEVELS=[
+ {k:'NOVICE',ru:'Новичок',d:'Впервые в горах или ходите редко. Простые шаги, только самое важное.',gets:['Что взять и как одеться','Что делать, если потерялись','Базовая первая помощь','Максимально короткие инструкции']},
+ {k:'AVERAGE',ru:'Средний',d:'Несколько походов за плечами. Добавляем оценку маршрута, погоды, воды.',gets:['Оценка сложности и времени','Погода, гроза, признаки переохлаждения и перегрева','Ориентирование и потеря маршрута','Расширенные чек-листы']},
+ {k:'ADVANCED',ru:'Продвинутый',d:'Опытный турист. Планирование, риски, автономный выход.',gets:['Оценка рисков маршрута и погоды','Аварийные сценарии, потеря связи','Расширенная первая помощь','Управление небольшой группой']},
+ {k:'EXPERT',ru:'Эксперт / профи',d:'Инструктор, руководитель группы, спасатель.',gets:['Журнал происшествий и план эвакуации','Отчёт для спасателей (SITREP)','Протокол руководителя и массовое происшествие','Контроль группы и расширенные памятки']}
+];
+
+const EMERGENCY_NUMBERS=[
+ {n:'112',t:'Единый номер экстренных служб'},
+ {n:'103',t:'Скорая помощь'},
+ {n:'101',t:'Пожарные и спасатели'},
+ {n:'102',t:'Полиция'}
+];
+
+/* sos:true — показывается в сетке SOS. call:true — в этом случае нужна экстренная помощь всегда. */
+const INC={
+ bleeding:{sos:1,em:'🩸',t:'Сильное кровотечение',call:1,
+  steps:['Убедитесь, что место безопасно. Наденьте перчатки, если есть.','Сильно прижмите к ране чистую ткань или бинт. Держите давление.','Ткань промокла? Не снимайте. Добавьте сверху ещё и продолжайте давить.','Уложите пострадавшего. Приподнимите рану выше уровня сердца, если нет подозрения на перелом.','Звоните 112 и передайте координаты.','Укутайте, следите за сознанием и дыханием.'],
+  adv:['Если давлением не остановить кровь из руки или ноги и есть жгут: наложите выше раны, затяните до остановки крови, запишите время.','Глубокая рана: плотно заполните тканью и давите поверх.'],
+  no:['Не вытаскивайте глубоко вошедшие предметы.','Не убирайте пропитанную повязку, добавляйте новую сверху.']},
+ fracture:{sos:1,em:'🦴',t:'Подозрение на перелом',call:1,
+  steps:['Остановитесь и оцените безопасность места.','Не заставляйте пострадавшего идти.','Не пытайтесь вправлять конечность.','Зафиксируйте конечность в найденном положении, если это не усиливает боль.','Сообщите руководителю группы.','Вызовите экстренную помощь.','Передайте координаты и состояние пострадавшего.'],
+  adv:['Проверьте чувствительность и цвет кожи ниже травмы; повторяйте каждые 15 минут.','Открытая рана: сначала остановите кровотечение, закройте чистой повязкой.','Шина: жёсткий предмет, фиксирует суставы выше и ниже, не пережимая.'],
+  no:['Не растирайте и не массируйте.','Не давайте нагружать конечность.']},
+ unconscious:{sos:1,em:'🧠',t:'Потеря сознания',call:1,
+  steps:['Оцените безопасность. Громко позовите, потрясите за плечи.','Нет реакции: зовите на помощь и звоните 112 на громкой связи.','Проверьте дыхание до 10 секунд: запрокиньте голову, поднимите подбородок.','Дышит нормально: положите в устойчивое боковое положение, укройте, наблюдайте.','Не дышит или дышит редко и странно: начинайте компрессии груди в центре, 100–120 в минуту, глубоко (около 5–6 см).','Не останавливайтесь, пока не приедет помощь или человек не начнёт дышать.'],
+  adv:['Обучены? 30 компрессий, затем 2 вдоха. Не обучены: только компрессии.','Подозрение на травму шеи или спины: двигайте только если нужно освободить дыхательные пути.'],
+  no:['Не давайте пить и есть.','Не оставляйте одного.']},
+ hypothermia:{sos:1,em:'🥶',t:'Переохлаждение',call:0,
+  steps:['Уведите от ветра и сырости.','Замените мокрую одежду на сухую, утеплите голову.','Изолируйте от земли: коврик, рюкзак.','Если в сознании и может глотать: тёплое сладкое питьё без алкоголя.','Тёплые фляги к туловищу: подмышки, грудь. Не на голую кожу напрямую.','Спутанность, дрожь прекратилась или не реагирует: звоните 112 сразу. Двигайте бережно.'],
+  adv:['Тяжёлое переохлаждение: держите горизонтально, минимум движений, следите за дыханием.'],
+  no:['Не растирайте.','Не давайте алкоголь.','Не греите резко горячей водой.','Не оставляйте одного.']},
+ heat:{sos:1,em:'☀️',t:'Перегрев',call:0,
+  steps:['Уведите в тень, уложите, ноги слегка приподнимите.','Снимите лишнюю одежду.','Охлаждайте: мокрая ткань на шею, подмышки, пах; обмахивайте.','В сознании: пейте небольшими глотками.','Спутанность, судороги, потеря сознания, очень горячая кожа: это тепловой удар. Звоните 112 и продолжайте охлаждать.'],
+  adv:['Электролиты вместе с водой при длительной потливости.'],
+  no:['Не давайте пить, если человек без сознания.','Не оставляйте на солнце.']},
+ lost:{sos:1,em:'😵',t:'Потеря ориентации',call:0,
+  steps:['Остановитесь. Не двигайтесь хаотично дальше.','Оцените безопасность места и погоду.','Попробуйте связаться с группой или руководителем.','Экономьте заряд телефона: режим полёта, низкая яркость.','Откройте сохранённую офлайн-карту, найдите последнюю известную точку.','Не идёт связь: сообщите взрослому или руководителю, при риске звоните 112.','Если нет уверенности в маршруте, оставайтесь на месте и подавайте сигналы (6 сигналов в минуту).'],
+  adv:['Вернитесь по своему следу к последней известной точке, если это безопасно и светло.','Не спускайтесь по крутому склону наугад: ручьи могут вести к обрывам.'],
+  no:['Не идите в темноте по неизвестному склону.','Не разделяйтесь.']},
+ breath:{sos:1,em:'🫁',t:'Проблемы с дыханием',call:1,
+  steps:['Помогите принять удобное сидячее положение, чуть наклонившись вперёд.','Расстегните тесную одежду. Успокаивайте, дышите медленно вместе.','Есть назначенный врачом ингалятор или препарат: помогите использовать по инструкции.','Человек хватается за горло и не может ни говорить, ни кашлять: 5 ударов между лопаток, затем 5 толчков в верх живота. Повторяйте.','Синеватые губы, сильная одышка, боль в груди, ухудшение: звоните 112 немедленно.'],
+  adv:['Одышка в покое, головная боль, спутанность на высоте: не поднимайтесь выше и спускайтесь при возможности.'],
+  no:['Не кладите на спину, если тяжело дышать.']},
+ fall:{sos:1,em:'⛰️',t:'Падение',call:1,
+  steps:['Остановите группу. Проверьте безопасность: камни, склон.','Не двигайте пострадавшего без необходимости: возможна травма шеи или спины.','Спросите: что болит? Может ли пошевелить пальцами?','Проверьте сознание, дыхание, кровотечение.','Утеплите и защитите от ветра.','Удар головой, потеря сознания, сильная боль, онемение: звоните 112.'],
+  adv:['Наблюдайте за пострадавшим: рвота, сонливость, спутанность после удара головой означают срочную помощь.'],
+  no:['Не поднимайте и не сажайте резко.','Не давайте еду и питьё при сильной боли и подозрении на травму головы.']},
+ storm:{sos:1,em:'⚡',t:'Гроза',call:0,
+  steps:['Спускайтесь с гребней, вершин и открытых склонов.','Не прячьтесь под одиночным деревом, у воды, рядом с металлом.','Рассредоточьтесь на несколько метров друг от друга.','Присядьте на изолирующий коврик или рюкзак, ноги вместе. Не ложитесь.','Уберите трекинговые палки.','Ждите 30 минут после последнего грома.'],
+  adv:['Считайте секунды от вспышки до грома: менее 30 секунд значит гроза близко.','Зона риска: гребни, полки, входы в пещеры, мокрые скалы.'],
+  no:['Не стойте группой.','Не стойте на вершине.']},
+ animal:{sos:1,em:'🐻',t:'Опасное животное',call:0,
+  steps:['Не бегите и не поворачивайтесь спиной.','Спокойно говорите, отходите медленно боком.','Дайте животному путь для отхода.','Держите детей рядом.','Не кормите и не фотографируйте вблизи.','Нападение, укус, царапина: промойте, обратитесь за помощью, при тяжёлом состоянии звоните 112.'],
+  adv:['Змея: не трогать, обездвижить конечность, ничего не отсасывать, звонить 112.'],
+  no:['Не приближайтесь, не бросайте предметы.']},
+ nocomm:{sos:1,em:'📡',t:'Нет связи',call:0,
+  steps:['Проверьте, не включён ли режим полёта. Перезагрузите телефон.','Поднимитесь на открытое место без риска.','Отправьте SMS: оно проходит при слабом сигнале.','Попробуйте 112: он может работать через любую доступную сеть.','Экономьте батарею: яркость вниз, режим полёта между попытками.','Подавайте сигнал: 6 свистков, вспышек или криков в минуту, затем пауза. Ответ: 3 в минуту.'],
+  adv:['Отправьте вперёд двоих с известным маршрутом к связи, оставив пострадавшего с остальными.','Заранее оставьте план у близких: они поднимут тревогу, если вы не вернётесь.'],
+  no:['Не разделяйтесь в одиночку в темноте.']},
+ other:{sos:1,em:'❓',t:'Другая чрезвычайная ситуация',call:1,
+  steps:['СТОП. Остановитесь и сделайте вдох.','Оцените безопасность себя и группы.','Проверьте: кто пострадал, кому нужна помощь прямо сейчас.','Не можете справиться: звоните 112.','Передайте: где вы, что произошло, сколько человек, состояние.'],adv:[],no:['Не действуйте в спешке.']},
+ /* не в сетке SOS, но есть в поиске и памятках */
+ missing:{em:'🔎',t:'Потерян участник группы',call:0,
+  steps:['Остановите всю группу. Пересчитайтесь по списку.','Определите, где и когда видели участника последний раз.','Позовите, подайте сигнал, подождите ответа.','Оставьте с группой ответственного взрослого. Не расходитесь поодиночке.','Отправьте двоих осмотреть последний участок маршрута.','Не нашли за 15–20 минут или темнеет или плохая погода: звоните 112 и сообщите последнюю точку и время.'],
+  adv:['Дайте спасателям: фото участника, одежда, возраст, здоровье, что с собой, куда мог пойти.'],no:['Не отпускайте остальных на поиски по одному.']},
+ burn:{em:'🔥',t:'Ожог',call:0,
+  steps:['Прекратите контакт с горячим. Уберите кольца и часы до отёка.','Охлаждайте проточной прохладной водой 10–20 минут.','Накройте чистой неприлипающей повязкой или плёнкой.','Обширный ожог, лицо, кисти, дыхательные пути или химический ожог: звоните 112.'],
+  adv:[],no:['Не используйте лёд, масло, зубную пасту.','Не прокалывайте пузыри.']},
+ bruise:{em:'🟣',t:'Ушиб',call:0,
+  steps:['Дайте покой ушибленному месту.','Приложите холод через ткань на 10–20 минут.','Придайте возвышенное положение, если это возможно.','Сильная боль, отёк или деформация: считайте переломом и действуйте как при переломе.'],
+  adv:[],no:['Не прикладывайте лёд прямо к коже.']},
+ sprain:{em:'🦶',t:'Растяжение',call:0,
+  steps:['Прекратите нагрузку.','Холод через ткань на 10–20 минут.','Зафиксируйте эластичным бинтом, не слишком туго.','Держите конечность выше уровня сердца.','Опора невозможна, нарастает боль или онемение: считайте переломом и звоните.'],
+  adv:['Проверяйте пальцы: цвет, тепло, чувствительность.'],no:['Не «разрабатывайте» сустав через боль.']}
+};
+const INC_IDS=Object.keys(INC);
+const SOS_IDS=INC_IDS.filter(k=>INC[k].sos);
+
+/* «Что делать, если...» — быстрые запросы */
+const QUICK=[
+ {q:'Я потерялся',k:['потерял','заблудил','не знаю где','ориентир','сбился'],id:'lost'},
+ {q:'Началась гроза',k:['гроза','молни','гром'],id:'storm'},
+ {q:'У человека болит нога',k:['нога','болит','пода','перелом','сломал','вывих','растяж','ушиб','рука'],id:'fracture'},
+ {q:'Человек потерял сознание',k:['сознан','обморок','упал без','не реагир'],id:'unconscious'},
+ {q:'Мы потеряли участника',k:['участник','ребёнок','ребенок','пропал','не нашли','потеряли'],id:'missing'},
+ {q:'Нет связи',k:['связ','сеть','телефон не','не ловит'],id:'nocomm'},
+ {q:'Человек замёрз',k:['замерз','замёрз','холод','озноб','дрожит','переохлажд'],id:'hypothermia'},
+ {q:'Очень жарко',k:['жарко','перегрев','солнеч','тепловой','жара'],id:'heat'},
+ {q:'Сильно течёт кровь',k:['кров','порез','рана'],id:'bleeding'},
+ {q:'Трудно дышать',k:['дыш','задыха','подавил','удуш','одышк'],id:'breath'},
+ {q:'Человек упал',k:['упал','падени','сорвал','скатил'],id:'fall'},
+ {q:'Ожог',k:['ожог','обжёг','обжег'],id:'burn'},
+ {q:'Встретили животное',k:['медвед','собак','змея','животн','волк','укус'],id:'animal'}
+];
+
+/* Памятки. cat: before | during | emergency | firstaid(генерится из INC). min — минимальный уровень; pro — добавка для уровня 2+; exp — для 3 */
+const MEMOS=[
+ {c:'before',t:'Что взять',s:['Вода: минимум 0,5 л на час пути, лучше с запасом','Еда: сытное и лёгкое, плюс запас на непредвиденное','Тёплый слой и дождевик даже в жару','Головной убор, солнцезащитные очки, крем','Фонарик или налобник','Аптечка, свисток','Документы и записанные контакты'],pro:['Запасная батарея для фонаря, спасательное одеяло','Расчёт воды по маршруту: время × 0,5 л + запас 1 л'],exp:['Групповое снаряжение: аптечка группы, бивак, ремнабор, средства связи']},
+ {c:'before',t:'Проверка погоды',s:['Смотрите прогноз накануне и утром','Проверьте ветер, осадки, грозу','Гроза или сильный ветер: перенесите поход','Сообщите о планах, если условия меняются'],pro:['Смотрите прогноз на высоте маршрута, не только «в городе»','Заложите окно погоды и время разворота'],exp:['Сравните 2–3 источника, выберите критерии отказа от выхода заранее']},
+ {c:'before',t:'Проверка маршрута',s:['Узнайте длину и набор высоты','Проверьте, открыта ли тропа','Найдите места, где можно свернуть и выйти','Оцените время с запасом'],pro:['Отметьте опасные участки и точки без связи','Подготовьте запасной маршрут'],exp:['Опишите точки принятия решения (go/no-go) и порядок эвакуации']},
+ {c:'before',t:'Одежда',s:['Слоями: базовый, тёплый, защитный от ветра и дождя','Не хлопок: он долго сохнет','Удобная закрытая обувь с протектором','Запасные носки и шапка'],pro:['Проверьте, что мокрая одежда заменима на сухую']},
+ {c:'before',t:'Вода и питание',s:['Пейте небольшими порциями регулярно, не ждите жажды','Перекусывайте каждые 1–2 часа','Возьмите соль или электролиты в жаркий день'],pro:['Планируйте точки пополнения воды и способ очистки']},
+ {c:'before',t:'Телефон и связь',s:['Зарядите телефон на 100%','Возьмите powerbank и кабель','Скачайте офлайн-карту и памятки','Сообщите близким маршрут и время возвращения','Сохраните номер 112'],pro:['Включите отправку координат, сохраните точку старта'],exp:['Определите резервный канал связи и контрольные выходы на связь']},
+ {c:'before',t:'Аптечка',s:['Бинты и салфетки','Перчатки','Пластыри и антисептик','Эластичный бинт','Личные лекарства, которые вам назначил врач'],pro:['Пластырь от натоптышей, обезболивающее по назначению врача','Спасательное одеяло']},
+ {c:'before',t:'План выхода',s:['Время старта и «время разворота»','Кто знает ваш маршрут','До какого часа вы вернётесь','Что делать, если не вернулись вовремя: кто позвонит и куда'],min:0},
+ {c:'during',t:'Как идти группой',s:['Идёт самый слабый впереди, опытный замыкает','Никто не отстаёт и не убегает вперёд','Считайте людей на каждом привале','Темп подстраивайте под слабого'],pro:['Ведущий и замыкающий имеют связь друг с другом'],exp:['Назначьте ответственных: ведущий, замыкающий, медик, связь']},
+ {c:'during',t:'Привалы',s:['Делайте привал до усталости, не после','Пейте, ешьте, проверьте ноги','Надевайте тёплый слой, пока не замёрзли','Не садитесь на мокрую землю'],pro:['Используйте привал для проверки погоды и времени разворота']},
+ {c:'during',t:'Усталость',s:['Замедлитесь, сделайте привал','Пейте и ешьте','Не идите через силу','Сообщите группе, что вам тяжело'],pro:['Сократите маршрут или разверните группу: усталость повышает риск травмы']},
+ {c:'during',t:'Как не потеряться',s:['Держитесь тропы и группы','Оглядывайтесь: запоминайте ориентиры в обе стороны','Сверяйтесь с картой на развилках','Потеряли тропу: остановитесь, вернитесь к последней уверенной точке'],pro:['Сверяйте азимут и карту; засекайте время и темп'],exp:['Фиксируйте координаты каждой контрольной точки']},
+ {c:'during',t:'Возле обрывов',s:['Держитесь подальше от края','Не фотографируйтесь у края','Дети идут ближе к стене, взрослый рядом','Не бегайте и не толкайтесь','Не заходите на края, где кромка может обвалиться'],pro:['Проверяйте устойчивость камней и грунта, особенно после дождя']},
+ {c:'during',t:'Сложные участки',s:['Остановитесь и оцените: справитесь ли все?','Переходите по одному, остальные ждут в безопасном месте','Мокрые камни и осыпь: короткие шаги, три точки опоры','Сомневаетесь: разверните группу'],pro:['Оцените запасной путь и время до темноты'],exp:['Определите порядок и страховку, распределите роли']},
+ {c:'emergency',t:'Потерялся',inc:'lost'},
+ {c:'emergency',t:'Потерялся участник группы',inc:'missing'},
+ {c:'emergency',t:'Гроза',inc:'storm'},
+ {c:'emergency',t:'Сильный дождь',s:['Наденьте дождевик, утеплитесь','Не переходите вброд ручьи и реки при подъёме воды','Осторожно на мокрых камнях и корнях','Сильный ливень: найдите безопасное укрытие, не под одиночным деревом'],pro:['Оцените риск паводка и селя: не стойте в русле ручья']},
+ {c:'emergency',t:'Туман',s:['Остановитесь и соберите группу','Держитесь вместе на расстоянии видимости','Откройте карту и сверьтесь','Если не уверены в маршруте, не идите дальше'],pro:['Ориентируйтесь по азимуту и рельефу, фиксируйте координаты']},
+ {c:'emergency',t:'Резкое похолодание',s:['Наденьте тёплый слой сразу, не ждите озноба','Пейте тёплое, ешьте','Спускайтесь ниже, уходите от ветра','Следите за детьми и слабыми: признаки переохлаждения'],pro:['Оцените необходимость разворота и время до укрытия']},
+ {c:'emergency',t:'Перегрев',inc:'heat'},
+ {c:'emergency',t:'Обезвоживание',s:['Остановитесь в тени','Пейте маленькими глотками','Добавьте соли или электролиты','Головокружение, спутанность, нет мочи: звоните за помощью','Дальше идите медленнее'],pro:['Считайте запас воды на оставшийся путь']},
+ {c:'emergency',t:'Травма',inc:'fracture'},
+ {c:'emergency',t:'Падение',inc:'fall'},
+ {c:'emergency',t:'Потеря связи',inc:'nocomm'},
+ {c:'emergency',t:'Массовое происшествие',min:3,s:['Обеспечьте безопасность группы и места','Назначьте командира и ответственных: помощь, безопасность, связь','Звоните 112: число пострадавших, состояние, координаты','Сначала помощь тем, кто не дышит, сильно кровоточит, без сознания','Ведите список пострадавших и время событий','Держите остальных вместе, в тепле, занятыми делом'],exp:['Подготовьте место для приёма помощи, сообщите подъезд и площадку']},
+ {c:'emergency',t:'Навигация без связи',min:1,s:['Найдите последнюю известную точку на офлайн-карте','Определите рельеф: где вы относительно линий, рек, хребтов','Идите по азимуту, а не «на глаз»','Ждите, если нет уверенности'],pro:['Используйте засечки по двум ориентирам'],exp:['Ведите контрольные точки и время']}
+];
+const AID_ORDER=['bleeding','burn','bruise','sprain','fracture','hypothermia','heat','unconscious','breath'];
+
+/* Чек-листы подготовки. min — минимальный уровень, crit — критичный пункт */
+const PREP=[
+ {g:'Документы',id:'docs',t:'Документы при себе',min:0},
+ {g:'Документы',id:'contacts',t:'Записаны контакты экстренных служб и близких',min:0,crit:1},
+ {g:'Снаряжение',id:'water',t:'Вода',min:0,crit:1,why:'вода — основа безопасности: от жажды до перегрева'},
+ {g:'Снаряжение',id:'food',t:'Еда',min:0},
+ {g:'Снаряжение',id:'warm',t:'Тёплая одежда',min:0,crit:1,why:'в горах холодает быстро'},
+ {g:'Снаряжение',id:'rain',t:'Дождевик',min:0},
+ {g:'Снаряжение',id:'light',t:'Фонарик / налобник',min:0},
+ {g:'Снаряжение',id:'aid',t:'Аптечка',min:0,crit:1},
+ {g:'Снаряжение',id:'nav',t:'Навигация',min:0},
+ {g:'Снаряжение',id:'whistle',t:'Свисток и спасательное одеяло',min:1},
+ {g:'Снаряжение',id:'spare',t:'Запасные батарейки для фонаря и ремнабор',min:2},
+ {g:'Снаряжение',id:'bivy',t:'Аварийное укрытие / бивак',min:2},
+ {g:'Телефон',id:'charge',t:'Телефон заряжен',min:0,crit:1},
+ {g:'Телефон',id:'pb',t:'Powerbank и кабель',min:0},
+ {g:'Телефон',id:'map',t:'Скачана офлайн-карта',min:0,crit:1,why:'без связи карта из сети не загрузится'},
+ {g:'Телефон',id:'pack',t:'Скачан офлайн-пакет Mountain Safe',min:0},
+ {g:'Маршрут',id:'route',t:'Изучен маршрут',min:0,crit:1},
+ {g:'Маршрут',id:'wx',t:'Проверена погода',min:0,crit:1},
+ {g:'Маршрут',id:'diff',t:'Известна сложность',min:0},
+ {g:'Маршрут',id:'back',t:'Есть план возвращения (время разворота)',min:0,crit:1},
+ {g:'Маршрут',id:'alt',t:'Есть запасной вариант',min:0},
+ {g:'Маршрут',id:'told',t:'Близкие знают маршрут и время возвращения',min:0},
+ {g:'Маршрут',id:'water_plan',t:'Рассчитан запас воды по времени пути',min:1},
+ {g:'Маршрут',id:'risk',t:'Отмечены точки риска и участки без связи',min:2},
+ {g:'Группа',id:'ppl',t:'Известны участники, их состояние и ограничения (по их желанию)',min:2},
+ {g:'Группа',id:'roles',t:'Назначены роли: ведущий, замыкающий, связь, медик',min:3},
+ {g:'Группа',id:'evac',t:'Есть план эвакуации и контрольные точки связи',min:3,crit:1}
+];
+const PREP_DEFAULT={docs:1,contacts:1,water:1,food:1,warm:1,rain:1,light:1,charge:1,pb:1,route:1,wx:1};
+
+/* Проверка для опытных */
+const CHECKSETS=[
+ {id:'grp',t:'Что проверить перед выходом группы?',items:['Погода','Маршрут','Запасной маршрут','Связь','Заряд устройств','Вода','Еда','Аптечка','Одежда','Навигация','Информация о каждом участнике','План экстренной эвакуации']},
+ {id:'go',t:'Перед сложным участком',items:['Окно погоды и время разворота','Все участники готовы физически','Снаряжение по участку есть у каждого','Отход и запасной путь понятны','Связь и контрольное время сообщены','Порядок движения и роли назначены']},
+ {id:'rest',t:'На привале',items:['Пересчитаны все участники','Проверены ноги и самочувствие','Вода и еда в порядке','Погода и время сверены с планом','Тёплый слой надет']},
+ {id:'hand',t:'Передача информации спасателям',items:['Координаты и время','Число пострадавших и состояние','Что уже сделано','Погода и видимость на месте','Ресурсы группы: тепло, еда, заряд','Место для приёма помощи','Контакт ответственного']}
+];
+const QUICK6=['Погода в норме','Связь есть','Заряд > 50%','Вода и еда','Все на месте','Время разворота известно'];
+
+/* Обучение */
+const LESSONS=[
+ {t:'Как подготовиться к походу',pts:['Проверьте погоду и маршрут накануне и утром','Сообщите близким маршрут и время возвращения','Возьмите воду, еду, тёплый слой, дождевик, аптечку, фонарик','Зарядите телефон, скачайте офлайн-карту','Планируйте вернуться до темноты'],
+  q:[{q:'Что важно сообщить близким?',o:['Только фото маршрута','Маршрут и время возвращения','Ничего, вернусь сам'],a:1},{q:'Когда скачивать офлайн-карту?',o:['До выхода, пока есть интернет','В горах, когда понадобится','Она не нужна'],a:0},{q:'Тёплая одежда в жаркий день?',o:['Оставлю дома','Возьму: погода в горах меняется','Только зимой'],a:1}]},
+ {t:'Как не потеряться',pts:['Держитесь тропы и группы','Оглядывайтесь и запоминайте ориентиры','Сверяйтесь с картой на развилках','Потеряли тропу: остановитесь и вернитесь к последней уверенной точке'],
+  q:[{q:'Вы потеряли тропу. Первое действие?',o:['Идти быстрее вперёд','Остановиться и оценить ситуацию','Спуститься напрямик по крутому склону'],a:1},{q:'Когда сверяться с картой?',o:['Только в конце','На развилках и заметных ориентирах','Никогда'],a:1},{q:'Группа растянулась. Что делать?',o:['Идти дальше','Собраться в безопасной точке и пересчитаться','Разойтись'],a:1}]},
+ {t:'Что делать при грозе',pts:['Признаки: растущие облака, порывы ветра, гром','Уйдите с гребней и вершин','Не прячьтесь под одиноким деревом и у воды','Рассредоточьтесь, присядьте на изолирующий коврик, ноги вместе','Ждите 30 минут после последнего грома'],
+  q:[{q:'Где НЕ стоит прятаться?',o:['Под одиноким деревом','Ниже гребня на изолирующем коврике','Вдали от воды'],a:0},{q:'Сколько ждать после последнего грома?',o:['5 минут','30 минут','1 минуту'],a:1},{q:'Как расположить группу?',o:['Плотной кучей','Рассредоточить на несколько метров','Всем на вершине'],a:1}]},
+ {t:'Первая помощь',pts:['Порядок: безопасность, сознание, дыхание, кровотечение, вызов помощи','Позвоните 112 при угрозе жизни','Не навредите: не двигайте без нужды при подозрении на травму позвоночника'],
+  q:[{q:'Что делать первым?',o:['Оценить безопасность','Дать лекарство','Переместить пострадавшего'],a:0},{q:'Сильное кровотечение:',o:['Сильно прижать чистой тканью','Промыть и ждать','Приложить лёд'],a:0},{q:'Человек без реакции, дышит нормально:',o:['Боковое положение и 112','Посадить и дать воды','Оставить одного'],a:0}]},
+ {t:'Переохлаждение',pts:['Признаки: дрожь, онемение, вялость, невнятная речь, спутанность','Уйдите от ветра и сырости, утеплите, изолируйте от земли','Тёплое сладкое питьё, если человек в сознании','Не растирайте и не давайте алкоголь'],
+  q:[{q:'Признак переохлаждения?',o:['Сильная дрожь и спутанность речи','Красное лицо и пот','Хороший аппетит'],a:0},{q:'Что нельзя?',o:['Давать алкоголь','Укутывать','Уводить от ветра'],a:0},{q:'Первое действие?',o:['Уйти от ветра и утеплить','Растирать снегом','Горячая ванна'],a:0}]},
+ {t:'Перегрев',pts:['Признаки: слабость, головная боль, сильный пот, тошнота','Тепловой удар: спутанность, судороги, горячая сухая кожа','Тень, охлаждение мокрой тканью, вода небольшими глотками','Спутанность — это 112'],
+  q:[{q:'Первое действие при перегреве?',o:['Уйти в тень и охлаждать','Продолжать идти','Надеть тёплую куртку'],a:0},{q:'Тепловой удар: что ещё?',o:['Звонить 112 и охлаждать','Ждать пару часов','Дать кофе'],a:0},{q:'Пить нужно',o:['Небольшими глотками регулярно','Раз в час','Только когда очень хочется'],a:0}]},
+ {t:'Травмы',pts:['Не заставляйте идти при подозрении на перелом','Фиксируйте в найденном положении, не вправляйте','Холод через ткань при ушибе и растяжении','Сильная боль, деформация, онемение: экстренная помощь'],
+  q:[{q:'Подозрение на перелом. Что нельзя?',o:['Вправлять конечность','Зафиксировать','Позвать помощь'],a:0},{q:'Как прикладывать холод?',o:['Через ткань 10–20 минут','Лёд на кожу','Не нужно'],a:0},{q:'Когда звонить в 112?',o:['Сильная боль, деформация, онемение','Никогда','Только вечером'],a:0}]},
+ {t:'Потеря связи',pts:['Отправьте SMS, оно проходит при слабом сигнале','Поднимитесь на открытое место без риска','Экономьте заряд: режим полёта, яркость вниз','Сигнал бедствия: 6 сигналов в минуту','Заранее оставьте план близким'],
+  q:[{q:'Что лучше работает при слабом сигнале?',o:['SMS','Видеозвонок','Стриминг'],a:0},{q:'Как экономить заряд?',o:['Режим полёта и низкая яркость','Играть в игры','Постоянно искать сеть'],a:0},{q:'Международный сигнал бедствия',o:['6 сигналов в минуту','1 сигнал в час','2 сигнала в день'],a:0}]},
+ {t:'Действия при чрезвычайной ситуации',pts:['Остановись. Осмотрись. Оцени опасность. Оповести.','Распределите роли: помощь, группа, связь','Запишите время и координаты','Передайте спасателям точную информацию'],
+  q:[{q:'Первое действие?',o:['Остановиться и оценить безопасность','Бежать','Разойтись'],a:0},{q:'Что передать спасателям?',o:['Координаты, число и состояние людей','Только имя','Ничего'],a:0},{q:'Зачем распределять роли?',o:['Чтобы не было хаоса','Незачем','Для скорости передвижения'],a:0}]}
+];
+
+/* ДЕМО-данные (не реальные): погода, маршрут, группа */
+const WX_SC={
+ clear:{n:'Ясно',temp:16,wind:12,rain:0,storm:5,vis:30,tr:{temp:-.3,wind:1,rain:0,storm:1}},
+ turn:{n:'Ухудшение',temp:8,wind:28,rain:1,storm:35,vis:8,tr:{temp:-1,wind:4,rain:1,storm:8}},
+ storm:{n:'Гроза и холод',temp:3,wind:55,rain:8,storm:80,vis:.8,tr:{temp:-1.2,wind:3,rain:1,storm:3}}
+};
+const DEMO_ROUTE={name:'Долина ДЕМО → озеро ДЕМО',dist:12,up:850,down:850,max:2650,type:'loop',start:'08:00',sunset:'19:30'};
+const DEMO_ELEV=[1800,1850,1990,2100,2260,2420,2520,2650,2600,2450,2200,2000,1850,1800];
+const DEMO_RISKS=[
+ {k:2.5,t:'Крутой склон',ic:'⚠️'},{k:4.1,t:'Участок с осыпью',ic:'⚠️'},{k:5.6,t:'Река / брод',ic:'⚠️'},{k:7.2,t:'Возможный обрыв',ic:'⚠️'},{k:8.4,t:'Участок с плохой связью',ic:'📡'}
+];
+const DEMO_REST=[{k:3,t:'Привал у ручья'},{k:6,t:'Поляна у озера'}];
+const DEMO_EXIT=[{k:2,t:'Выход к дороге (A)'},{k:7.5,t:'Выход к базе (B)'}];
+const DEMO_MEMBERS=[
+ {n:'Айгерим',lv:0,st:'ok',comm:'ok',ago:2,med:''},
+ {n:'Данияр',lv:0,st:'ok',comm:'weak',ago:4,med:''},
+ {n:'Ерлан',lv:1,st:'ok',comm:'ok',ago:1,med:''},
+ {n:'Мадина',lv:0,st:'ok',comm:'ok',ago:3,med:''},
+ {n:'Тимур',lv:1,st:'ok',comm:'ok',ago:5,med:''},
+ {n:'Алина',lv:0,st:'ok',comm:'ok',ago:2,med:''}
+];
+
+const STATUS={ok:{t:'OK',c:'ok'},help:{t:'Нужна помощь',c:'warn'},emergency:{t:'Emergency',c:'crit'},nocomm:{t:'Нет связи',c:'off'}};
+const DEMO_STEPS=[
+ {t:'Группа идёт по маршруту',d:'Погода ясная, связь есть. Все участники отмечены OK.',fx:'reset'},
+ {t:'Погода резко ухудшается',d:'Ветер усиливается, растёт вероятность грозы. Приложение поднимает уровень риска.',fx:'wx1'},
+ {t:'Связь становится слабой',d:'Индикатор переходит в WEAK CONNECTION. Приложение предупреждает: сохраните данные заранее.',fx:'weak'},
+ {t:'Участник получает травму',d:'Тимур упал на осыпи и держится за ногу. Статус группы меняется.',fx:'injury'},
+ {t:'Вы нажимаете SOS',d:'Выбираете «Подозрение на перелом». Приложение не ждёт от вас чтения статей.',fx:'sos'},
+ {t:'Stress Mode: один экран, одно действие',d:'Шесть коротких вопросов, затем пошаговая помощь. Ответы уже подставлены для демо.',fx:'stress'},
+ {t:'Связь пропала: работаем офлайн',d:'Индикатор OFFLINE. Все алгоритмы, карточка и сообщение спасателям остаются доступны.',fx:'offline'},
+ {t:'Emergency Card и план до прибытия помощи',d:'Карточка показывается спасателям и содержит QR. Сообщение готово к отправке по SMS или голосом.',fx:'card'}
+];
+
+
+// ===== FILE: public/js/core.js =====
+/* ================= STATE ================= */
+const KEY='mountain-safe-v1';
+const E=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const $=s=>document.querySelector(s);
+const tm=ts=>new Date(ts).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+const agoTxt=ts=>{const m=Math.max(0,Math.round((Date.now()-ts)/60000));return m<1?'только что':m<60?m+' мин назад':Math.round(m/60)+' ч назад'};
+function DEF(){return{
+ level:0,view:'home',prep:{...PREP_DEFAULT},
+ route:{...DEMO_ROUTE,risks:DEMO_RISKS.map(r=>({...r})),rest:DEMO_REST.map(x=>({...x})),exits:DEMO_EXIT.map(x=>({...x})),alt:'Вернуться по тропе к выходу A (ДЕМО)'},
+ wx:{sc:'clear',temp:16,wind:12,rain:0,storm:5,vis:30},
+ group:{name:'Поход 9А',mode:'school',members:DEMO_MEMBERS.map((m,i)=>({id:i+1,...m,seen:Date.now()-m.ago*60000})),nextId:50,evac:'',warn:false},
+ card:{name:'Тимур (пример)',phone:'+7 000 000 00 00',cname:'Мама (пример)',group:'Поход 9А',route:DEMO_ROUTE.name,start:'Парковка у входа в долину',back:'17:30',status:'ok',coords:'',coordsAt:0},
+ learn:{},log:[],pack:null,sim:'auto',checks:{},quick:{},demo:-1,
+ gps:null,track:[],tracking:false,wxLive:null,wxLocText:'',addMode:'',
+ sync:{code:'',role:'',memberId:0,token:'',name:'',data:null,queue:[],lastPull:0,myStatus:'ok',shareLoc:false,ackedAt:0,seenEm:{}}}}
+function load(){let s=DEF();try{const raw=localStorage.getItem(KEY);if(raw)s=Object.assign(s,JSON.parse(raw))}catch(e){}s.view='home';s.demo=-1;return s}
+let S=load();let saveT;
+function save(){clearTimeout(saveT);saveT=setTimeout(()=>{try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}},150)}
+function setPath(p,v){const k=p.split('.');let o=S;for(let i=0;i<k.length-1;i++)o=o[k[i]];o[k[k.length-1]]=v;save()}
+
+/* ================= ICONS ================= */
+const ICONS={home:'M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10',alert:'M12 3l10 18H2L12 3zM12 10v5M12 18h.01',list:'M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2',route:'M6 20a2 2 0 100-4 2 2 0 000 4zM18 8a2 2 0 100-4 2 2 0 000 4zM8 18h7a3 3 0 000-6H9a3 3 0 010-6h7',cloud:'M7 18a4 4 0 010-8 5 5 0 019.5-1A4.5 4.5 0 0117 18H7z',book:'M4 5a2 2 0 012-2h13v16H6a2 2 0 00-2 2V5zM8 7h7M8 11h5',shield:'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3zM8.5 12l2.5 2.5 4.5-5',cross:'M10 3h4v7h7v4h-7v7h-4v-7H3v-4h7V3z',cap:'M2 9l10-5 10 5-10 5L2 9zM6 11.5V16c0 1.5 3 3 6 3s6-1.5 6-3v-4.5',help:'M12 3a9 9 0 100 18 9 9 0 000-18zM9.5 9.5a2.5 2.5 0 115 0c0 1.7-2.5 2-2.5 3.5M12 17h.01',users:'M9 11a3.5 3.5 0 100-7 3.5 3.5 0 000 7zM2 20c0-3.5 3-6 7-6s7 2.5 7 6M17 4.5a3.5 3.5 0 010 6.5M22 20c0-2.5-1.5-4.5-4-5.5',card:'M3 6h18v12H3zM7 10h4M7 14h6M15 10h2',download:'M12 3v12M7 11l5 5 5-5M4 20h16',play:'M7 4l13 8-13 8V4z',info:'M12 3a9 9 0 100 18 9 9 0 000-18zM12 11v5M12 8h.01',grid:'M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z',mountain:'M2 20l7-12 4 6 3-4 6 10H2z',bolt:'M13 2L4 14h7l-1 8 9-12h-7l1-8z',pin:'M12 21s-7-6.2-7-11a7 7 0 1114 0c0 4.8-7 11-7 11zM12 12a2 2 0 100-4 2 2 0 000 4z',copy:'M9 9h11v11H9zM5 15V4h11'};
+const ic=(n,c='')=>`<svg class="ic ${c}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[n]||''}"/></svg>`;
+
+/* ================= HELPERS ================= */
+const CONN={online:{t:'ONLINE',c:'ok'},weak:{t:'WEAK CONNECTION',c:'warn'},offline:{t:'OFFLINE',c:'crit'}};
+function conn(){if(S.sim!=='auto')return S.sim;if(navigator.onLine===false)return 'offline';const c=navigator.connection;if(c&&(/(^|-)2g/.test(c.effectiveType||'')||c.saveData))return 'weak';return 'online'}
+const RISK=[{t:'Низкий риск',c:'ok'},{t:'Повышенное внимание',c:'warn'},{t:'Высокий риск',c:'hi'},{t:'Критический риск',c:'crit'}];
+const DIFF=[{t:'Лёгкий',c:'ok'},{t:'Средний',c:'warn'},{t:'Сложный',c:'hi'},{t:'Очень сложный',c:'crit'}];
+const lvName=()=>LEVELS[S.level].k;
+function head(t,p,extra=''){return`<div class="head"><div class="row sp"><h1>${t}</h1>${extra}</div>${p?`<p>${p}</p>`:''}</div>`}
+const demoB='<span class="badge demo">DEMO</span>';
+let toastT;function toast(m){const t=$('#toast');t.innerHTML=`<div class="toast" role="status">${E(m)}</div>`;clearTimeout(toastT);toastT=setTimeout(()=>t.innerHTML='',2200)}
+async function copy(text){try{await navigator.clipboard.writeText(text);toast('Скопировано')}catch(e){try{const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();toast('Скопировано')}catch(e2){toast('Выделите текст и скопируйте вручную')}}}
+function logAdd(t,type='info'){S.log.unshift({ts:Date.now(),t,type});S.log=S.log.slice(0,200);save()}
+
+/* ================= SHELL ================= */
+const NAV=[['home','Главная','home'],['sos','SOS','alert'],['prep','Подготовка','list'],['route','Маршрут','route'],['weather','Погода и риски','cloud'],['memos','Памятки','book'],['check','Проверка','shield'],['aid','Первая помощь','cross'],['learn','Обучение','cap'],['what','Что делать, если…','help'],['group','Моя группа','users'],['card','Emergency Card','card'],['offline','Офлайн-режим','download'],['demo','Демо-сценарий','play'],['level','Уровень подготовки','mountain'],['about','О проекте','info']];
+const LOGO='<svg class="ic" viewBox="0 0 24 24"><path d="M2 20l7-12 4 6 3-4 6 10H2z"/></svg>';
+function renderShell(){
+ document.body.classList.toggle('is-landing',S.view==='landing');
+ const cn=CONN[conn()];
+ $('#top').innerHTML=`<button class="brand" data-a="go" data-v="landing" aria-label="О продукте"><span class="logo">${LOGO}</span>Mountain Safe</button>
+  <button class="pill" data-a="go" data-v="offline" title="Состояние связи"><span class="dot ${cn.c}"></span>${cn.t}</button>
+  <button class="pill" data-a="go" data-v="level" title="Уровень подготовки">${ic('mountain','sm')}${lvName()}</button>
+  <button class="btn sm dng" data-a="stress">Stress Mode</button>`;
+ const grp=(t,ids)=>`<small>${t}</small>`+ids.map(id=>{const n=NAV.find(x=>x[0]===id);return`<button class="nav ${n[0]==='sos'?'sos':''} ${S.view===id?'on':''}" data-a="go" data-v="${id}">${ic(n[2])}${n[1]}</button>`}).join('');
+ $('#side').innerHTML=`<button class="brand" data-a="go" data-v="landing"><span class="logo">${LOGO}</span>Mountain Safe</button>`+grp('Главное',['home','sos','prep','route','weather'])+grp('Знания',['memos','check','aid','learn','what'])+grp('Группа и данные',['group','card','offline'])+grp('Прототип',['demo','level','about']);
+ const tab=(id,l,i,cls='')=>`<button class="tab ${cls} ${S.view===id?'on':''}" data-a="go" data-v="${id}">${ic(i)}<span>${l}</span></button>`;
+ $('#tabbar').innerHTML=tab('home','Главная','home')+tab('prep','Подготовка','list')+tab('sos','SOS','alert','sos')+tab('route','Маршрут','route')+tab('more','Ещё','grid');
+ const c=conn();
+ $('#banner').innerHTML=(typeof syncBanner==='function'?syncBanner():'')+(c==='offline'?`<div class="offbanner">${ic('alert')}<div><b>OFFLINE.</b> Приложение работает по сохранённым данным. Отправка и обновления недоступны, алгоритмы, карточка и чек-листы работают.</div></div>`:c==='weak'?`<div class="weakbanner"><b>Слабая связь.</b> Отправляйте важное короткими сообщениями (SMS). Скачайте офлайн-пакет заранее.</div>`:'');
+ const d=S.demo;document.body.classList.toggle('demo-on',d>=0);
+ $('#demobar').innerHTML=d>=0?`<div class="demo-bar"><span class="badge demo">DEMO ${d+1}/${DEMO_STEPS.length}</span><b class="small" style="flex:1">${E(DEMO_STEPS[d].t)}</b><button class="btn sm pri" data-a="demonext">${d>=DEMO_STEPS.length-1?'Завершить':'Дальше'}</button><button class="btn sm ghost" data-a="go" data-v="demo">К демо</button></div>`:'';
+}
+let curInc=null;const DONE={};
+function render(){if(typeof mapDestroy==='function')mapDestroy();renderShell();const V=VIEWS[S.view]||vHome;$('#view').innerHTML=V();if(typeof afterRender==='function')afterRender()}
+function go(v){if(v!=='landing'&&!S.entered){S.entered=true}S.view=v;curInc=null;render();window.scrollTo({top:0});save()}
+function ov(h){$('#overlay').innerHTML=h?`<div class="ov" role="dialog" aria-modal="true">${h}</div>`:''}
+
+/* ================= HOME ================= */
+function numsCard(){return`<div class="card flat"><div class="sect-t">Экстренные номера</div>${EMERGENCY_NUMBERS.map(x=>`<div class="emnum"><b>${x.n}</b><span class="muted small" style="flex:1">${x.t}</span><a class="btn sm" href="tel:${x.n}">Позвонить</a></div>`).join('')}<div class="tiny">Ссылка на звонок может не сработать в этом окне: номер написан крупно. Номера указаны для Казахстана, проверьте номера своего региона.</div></div>`}
+function prepVis(){return PREP.filter(p=>p.min<=S.level)}
+function prepPct(){const v=prepVis();return v.length?Math.round(v.filter(p=>S.prep[p.id]).length/v.length*100):0}
+function vHome(){
+ const L=LEVELS[S.level],cn=CONN[conn()],pct=prepPct(),rk=RISK[wxRisk(S.wx).l];
+ const tiles=[['sos','alert','SOS','Что делать сейчас'],['route','route','Маршрут','Сложность и риски'],['prep','list','Подготовка','Чек-лист и готовность'],['aid','cross','Первая помощь','Короткие алгоритмы'],['memos','book','Памятки','Библиотека'],['group','users','Моя группа','Статусы и перекличка']];
+ return`<section class="hero">
+  <svg class="peaks" viewBox="0 0 400 160" aria-hidden="true"><path d="M0 160L90 40l50 70 60-90 80 110 40-50 80 80z" fill="none" stroke="var(--g)" stroke-width="2"/><path d="M0 160L60 90l40 40 70-100 70 100 60-60 100 90z" fill="var(--gs)"/></svg>
+  <div><h1>Mountain Safe</h1></div>
+  <p class="tag">Безопасность начинается до того, как вы отправились в горы.</p>
+  <button class="sosbtn" data-a="go" data-v="sos" aria-label="SOS, экстренная помощь">${ic('alert','lg')}SOS</button>
+  <div class="grid g3s">
+   <button class="stat" data-a="go" data-v="level"><span>Ваш уровень</span><b>${L.k}</b></button>
+   <button class="stat" data-a="go" data-v="offline"><span>Режим</span><b><span class="dot ${cn.c}" style="display:inline-block;margin-right:6px"></span>${cn.t.split(' ')[0]}</b></button>
+   <button class="stat" data-a="go" data-v="prep"><span>Готовность</span><b>${pct}%</b></button>
+  </div></section>
+  <div class="grid g3t">${tiles.map(t=>`<button class="tile" data-a="go" data-v="${t[0]}"><span class="ti">${ic(t[1])}</span><b>${t[2]}</b><span>${t[3]}</span></button>`).join('')}</div>
+  <div class="grid g2">
+   <button class="card" style="text-align:left" data-a="stress"><span class="sect-t">Stress Mode</span><h3>Один экран — одно действие</h3><span class="muted small">6 коротких вопросов и пошаговый план. Для момента, когда трудно думать.</span></button>
+   <button class="card" style="text-align:left" data-a="go" data-v="check"><span class="sect-t">Быстрая проверка</span><h3>10 секунд перед выходом</h3><span class="muted small">Шесть пунктов. Сразу видно, что не готово.</span></button>
+  </div>
+  <div class="risk tone-${rk.c}"><span class="dot ${rk.c}"></span><div style="flex:1"><b>${rk.t}</b> · погода ${wxBadge()}<div class="small muted">${wxSourceLine()}</div></div><button class="btn sm" data-a="go" data-v="weather">Подробнее</button></div>
+  <div class="card"><div class="row sp"><h3>Для уровня ${L.k}</h3><button class="btn sm ghost" data-a="go" data-v="level">Сменить</button></div><ul class="muted" style="margin:0;padding-left:18px">${L.gets.map(g=>`<li>${g}</li>`).join('')}</ul></div>
+  <button class="btn big" data-a="go" data-v="demo" style="border-color:var(--warn)">${ic('play')} Смотреть демо-сценарий ЧС</button>`}
+
+/* ================= LEVEL ================= */
+function vLevel(){return`${head('Уровень подготовки','Уровень меняет содержание: количество шагов, глубину советов, чек-листы и инструменты руководителя.')}
+ <div class="grid g2">${LEVELS.map((l,i)=>`<button class="lvlcard ${S.level===i?'on':''}" data-a="setlevel" data-v="${i}"><div class="row sp"><h2>${l.k}</h2>${S.level===i?'<span class="badge g">Выбран</span>':''}</div><div class="muted small">${l.d}</div><ul>${l.gets.map(g=>`<li>${g}</li>`).join('')}</ul></button>`).join('')}</div>
+ <div class="card flat"><div class="sect-t">Что меняется при смене уровня</div><div class="small muted">Чек-лист подготовки: ${PREP.filter(p=>p.min<=S.level).length} пунктов. Памятки: ${MEMOS.filter(m=>(m.min||0)<=S.level).length} доступно. SOS-алгоритмы: ${S.level>=2?'с расширенными шагами':'краткие'}${S.level>=3?' и протоколом руководителя':''}. Инструменты руководителя (журнал, план эвакуации): ${S.level>=3?'включены':'с уровня EXPERT'}.</div></div>`}
+
+/* ================= SOS ================= */
+function vSos(){
+ if(curInc)return vInc(curInc);
+ return`${head('SOS. Что произошло?','Выберите ситуацию и получите короткий алгоритм.')}
+ <div class="dngbox row sp"><div><b>Угроза жизни?</b> Сначала звоните <span class="num">112</span>.</div><button class="btn sm dng" data-a="stress">Stress Mode</button></div>
+ <div class="grid g3">${SOS_IDS.map(id=>`<button class="inc" data-a="inc" data-id="${id}"><span class="em">${INC[id].em}</span><b>${INC[id].t}</b></button>`).join('')}</div>${numsCard()}`}
+const LEAD=['Назначьте ответственных: за пострадавшего, за группу, за связь.','Запишите время события и первичное состояние пострадавшего.','Сформируйте сообщение спасателям и передайте его.','Решите: эвакуация силами группы или ожидание спасателей на месте.'];
+function vInc(id){const I=INC[id],lv=S.level,dn=DONE[id]||(DONE[id]={});
+ const li=(t,i,cls,pre)=>`<li class="${cls} ${dn[pre+i]?'done':''}" data-a="dstep" data-id="${id}" data-k="${pre+i}" role="button" tabindex="0">${E(t)}</li>`;
+ return`<div class="row"><button class="btn sm ghost" data-a="incback">← Все ситуации</button></div>
+ ${head(I.em+' '+I.t)}
+ ${I.call?'<div class="dngbox"><b>Нужна экстренная помощь.</b> Позвоните 112 как можно раньше.</div>':'<div class="warnbox">Если состояние ухудшается или вы не уверены, звоните 112.</div>'}
+ <ol class="steps">${I.steps.map((t,i)=>li(t,i,'','s')).join('')}</ol>
+ ${lv>=2&&I.adv.length?`<div class="sect-t">Расширенно</div><ol class="steps">${I.adv.map((t,i)=>li(t,i,'adv','a')).join('')}</ol>`:''}
+ ${lv>=3?`<div class="sect-t">Протокол руководителя</div><ol class="steps">${LEAD.map((t,i)=>li(t,i,'adv','l')).join('')}</ol>`:''}
+ ${I.no.length?`<div class="sect-t">Нельзя</div>${I.no.map(t=>`<div class="dont">${E(t)}</div>`).join('')}`:''}
+ <div class="grid g2"><button class="btn pri" data-a="stress" data-id="${id}">Пошагово (Stress Mode)</button><button class="btn" data-a="sitrep" data-id="${id}">Сообщение спасателям</button><button class="btn" data-a="go" data-v="card">Emergency Card</button>${lv>=3?`<button class="btn" data-a="logsos" data-id="${id}">Записать в журнал</button>`:''}</div>${numsCard()}`}
+
+/* ================= STRESS MODE ================= */
+let ST=null;
+const STK=['inc','danger','who','move','comm','where'];
+const STQ={danger:{q:'Есть ли непосредственная опасность?',h:'Камни, крутой склон, вода, молния, огонь.',o:[['yes','ДА'],['no','НЕТ']]},who:{q:'Кто пострадал?',o:[['me','Я'],['other','ДРУГОЙ ЧЕЛОВЕК']]},move:{q:'Может ли человек двигаться?',o:[['yes','ДА'],['no','НЕТ'],['unk','НЕ ЗНАЮ']]},comm:{q:'Есть ли связь?',o:[['yes','ДА'],['weak','СЛАБАЯ'],['no','НЕТ']]}};
+function stressStart(inc,preset){ST={a:Object.assign({inc:inc||null,danger:null,who:null,move:null,comm:null,where:S.card.coords||''},preset||{}),q:inc?1:0,pi:0,phase:'ask'};if(preset){ST.plan=buildPlan(ST.a);ST.phase='plan'}drawST()}
+function buildPlan(a){const I=INC[a.inc||'other'],P=[];
+ if(a.danger==='yes')P.push({h:'Сначала безопасность',t:'Если можете безопасно, уйдите или уведите группу от опасности: камни, склон, вода. Собой не рискуйте.'});
+ P.push(a.who==='me'?{h:'Позаботьтесь о себе',t:'Сядьте или лягте в безопасном месте. Дышите медленно: вдох на 4, выдох на 6.'}:{h:'Подойдите к человеку',t:'Только если это безопасно. Скажите, что вы рядом и поможете.'});
+ if(a.move==='no'&&!['lost','nocomm','storm','animal'].includes(a.inc))P.push({h:'Не перемещайте',t:'Человек не может двигаться. Оставьте на месте, утеплите, не заставляйте идти.'});
+ I.steps.forEach(t=>P.push({h:I.t,t}));
+ if(S.level>=2)I.adv.forEach(t=>P.push({h:I.t+' · расширенно',t}));
+ if(a.comm==='yes')P.push({h:'Вызовите помощь',t:'Позвоните 112. Скажите: где вы, что случилось, сколько человек, в каком они состоянии.'});
+ else if(a.comm==='weak')P.push({h:'Слабая связь',t:'Поднимитесь на открытое место без риска. Отправьте SMS с координатами, затем звоните 112. Повторяйте попытки.'});
+ else P.push({h:'Нет связи',t:'Отправьте двоих к месту со связью, не оставляя пострадавшего одного. Подавайте сигнал: 6 в минуту, пауза, снова.'});
+ P.push(a.where?{h:'Ваше место',t:'Координаты: '+a.where+'. Передайте их спасателям.'}:{h:'Опишите место',t:'Назовите ориентиры: река, хребет, тропа, время пути от старта. Откройте офлайн-карту.'});
+ P.push({report:1,h:'Сообщение для спасателей',t:''});return P}
+const SA={danger:{yes:'Есть',no:'Нет'},who:{me:'Я сам(а)',other:'Другой человек'},move:{yes:'Может',no:'Не может',unk:'Неизвестно'},comm:{yes:'Есть',weak:'Слабая',no:'Нет'}};
+function sitrep(a){const I=INC[a.inc||'other'],c=S.card,g=S.group;
+ return['MOUNTAIN SAFE — СООБЩЕНИЕ СПАСАТЕЛЯМ','Время: '+tm(Date.now()),'Что случилось: '+I.t,'Пострадавший: '+(SA.who[a.who]||'не указано'),'Может двигаться: '+(SA.move[a.move]||'не указано'),'Опасность на месте: '+(SA.danger[a.danger]||'не указано'),'Связь: '+(SA.comm[a.comm]||'не указано'),'Координаты: '+(a.where||'неизвестны, опишу ориентиры')+(S.gps&&a.where&&a.where.indexOf(fmtCoord(S.gps.lat,S.gps.lon))===0?' (точность ±'+S.gps.acc+' м, определено '+tm(S.gps.ts)+')':''),'Группа: '+(S.sync.code&&S.sync.data?S.sync.data.name+', '+S.sync.data.members.length:g.name+', '+g.members.length)+' чел.','Маршрут: '+c.route,'Старт: '+c.start,'Контакт: '+c.cname+' '+c.phone].join('\n')}
+function drawST(){
+ if(!ST){ov('');return}
+ const cn=CONN[conn()];
+ const top=`<div class="row sp"><span class="st-calm">СПОКОЙНО. МЫ ПОМОЖЕМ ТЕБЕ ПОШАГОВО.</span><button class="btn sm" data-a="stclose">Выйти</button></div><div class="row sp"><span class="pill"><span class="dot ${cn.c}"></span>${cn.t}</span><a class="btn sm dng" href="tel:112">112</a></div>`;
+ let body='',foot='';
+ if(ST.phase==='ask'){const k=STK[ST.q];
+  body=`<div class="tiny">Вопрос ${ST.q+1} из ${STK.length}</div>`;
+  if(k==='inc')body+=`<div class="st-h">Что произошло?</div><div class="grid g3">${SOS_IDS.map(id=>`<button class="inc" data-a="stpick" data-k="inc" data-v="${id}"><span class="em">${INC[id].em}</span><b>${INC[id].t}</b></button>`).join('')}</div>`;
+  else if(k==='where')body+=`<div class="st-h">Где вы находитесь?</div><p class="muted">Введите координаты или ориентиры, либо определите по GPS. Последние сохранённые координаты подставлены заранее.</p><input id="stWhere" value="${E(ST.a.where)}" placeholder="Например: 43.12345, 77.12345 или «у озера, 3 ч от старта»"><div class="ans"><button class="btn" data-a="stgps">Определить по GPS</button><button class="btn pri" data-a="stwhere">Дальше</button><button class="btn" data-a="stwhere" data-v="0">Не знаю, где я</button></div>`;
+  else{const q=STQ[k];body+=`<div class="st-h">${q.q}</div>${q.h?`<p class="muted">${q.h}</p>`:''}<div class="ans">${q.o.map(o=>`<button class="btn ${o[0]==='yes'&&k==='danger'?'dng':''}" data-a="stpick" data-k="${k}" data-v="${o[0]}">${o[1]}</button>`).join('')}</div>`}
+  if(ST.q>0)foot=`<button class="btn ghost" data-a="stback">← Назад</button>`;
+ }else{const P=ST.plan,p=P[ST.pi];
+  if(p.report)body=`<div class="tiny">Шаг ${ST.pi+1} из ${P.length}</div><div class="st-h">Сообщение для спасателей</div><div class="sit" id="sitTxt">${E(sitrep(ST.a))}</div><div class="grid g2"><a class="btn pri" href="${E(smsHref(sitrep(ST.a)))}">SMS близкому</a><button class="btn" data-a="sharesit">Поделиться</button><button class="btn" data-a="copysit">Скопировать</button>${S.sync.code?'<button class="btn dng" data-a="stgroup">Сообщить группе</button>':''}<button class="btn" data-a="stcard">Emergency Card</button><button class="btn" data-a="stlog">Записать в журнал</button></div><div class="warnbox">Передайте это по 112 голосом. SMS проходит при слабом сигнале. Пока идёт помощь: держите пострадавшего в тепле и следите за дыханием.</div>`;
+  else body=`<div class="big-step"><div class="n">Шаг ${ST.pi+1} из ${P.length}</div>${p.h?`<div class="sect-t">${E(p.h)}</div>`:''}<div class="t">${E(p.t)}</div></div>`;
+  foot=`<div class="grid g2"><button class="btn" data-a="stprev" ${ST.pi===0?'disabled':''}>← Назад</button>${p.report?`<button class="btn pri" data-a="stclose">Готово</button>`:`<button class="btn pri" data-a="stnext">Сделано, дальше</button>`}</div>`}
+ ov(`<div class="in">${top}${body}<div style="flex:0">${foot}</div></div>`)}
+
+
+// ===== FILE: public/js/landing.js =====
+/* Витрина продукта: первая страница сайта. Не содержит данных пользователя. */
+function vLanding(){
+ const causes=['Недостаточная подготовка','Ошибка в оценке сложности','Потеря ориентира','Резкая смена погоды','Переохлаждение и перегрев','Травмы и падения','Нет связи','Паника и неверные решения','Незнание первой помощи'];
+ const lv=[['NOVICE','Впервые в горах','Что взять, как одеться, что нельзя, что делать при потере группы. Короткие шаги.'],['AVERAGE','Несколько походов','Сложность маршрута, вода, ориентирование, гроза, признаки переохлаждения и перегрева.'],['ADVANCED','Опытный турист','Риски маршрута, аварийные сценарии, потеря связи, автономный выход, расширенная первая помощь.'],['EXPERT','Руководитель, инструктор','Журнал происшествий, план эвакуации, отчёт для спасателей, протокол массового происшествия.']];
+ const feats=[['alert','SOS за два касания','12 ситуаций: кровотечение, перелом, потеря сознания, гроза, потеря ориентации. Короткие шаги и «нельзя».'],['bolt','Stress Mode','Один экран, одно действие. Шесть вопросов, затем план и готовое сообщение спасателям.'],['download','Работает без связи','Приложение и алгоритмы хранятся на телефоне. Отчёты группы копятся и уходят, когда сеть вернётся.'],['card','Emergency Card','Имя, контакт, маршрут, время возвращения, координаты и QR. Один экран для спасателей.'],['users','Группа','Статусы, позиции для руководителя и запрос «Все на месте» с подтверждением каждого.'],['cloud','Погода и риск','Четыре уровня риска по ветру, осадкам, грозе, видимости и температуре.'],['route','Маршрут и карта','Импорт GPX, набор высоты, профиль, точки риска, запись пройденного пути.'],['cap','Обучение','Девять коротких уроков и квизы: подготовка, гроза, переохлаждение, потеря связи.']];
+ const who=[['Новичок','Не знает, с чего начать'],['Обычный турист','Оценить маршрут и погоду'],['Опытный турист','Проверить, а не читать базу'],['Руководитель группы','Контроль людей и связь'],['Семья','Дети рядом, страх потеряться'],['Школьная группа','Ответственность и подсчёт']];
+ const done=[['Пошаговые алгоритмы, Stress Mode, Emergency Card','Реализовано'],['Офлайн: Service Worker, установка как приложения','Реализовано в полной версии'],['GPS, запись пути, карта, импорт GPX','Реализовано в полной версии'],['Реальная погода Open-Meteo','Реализовано в полной версии'],['Онлайн-группы через сервер','Реализовано в полной версии'],['Демо-сценарий чрезвычайной ситуации','ДЕМО'],['Казахский язык, векторные офлайн-карты, push, ИИ-ассистент','План']];
+ const b=(a,t,c='',d='')=>`<button class="btn ${c}" data-a="${a}" ${d}>${t}</button>`;
+ return`<div class="lp">
+ <header class="lp-nav"><button class="brand" data-a="scrollto" data-id="lp-top" aria-label="Наверх"><span class="logo">${LOGO}</span>Mountain Safe</button>
+  <nav class="lp-links" aria-label="Разделы сайта"><button data-a="scrollto" data-id="lp-how">Как работает</button><button data-a="scrollto" data-id="lp-levels">Уровни</button><button data-a="scrollto" data-id="lp-feat">Возможности</button><button data-a="scrollto" data-id="lp-status">Что готово</button></nav>
+  ${b('go','Открыть приложение','pri sm','data-v="home"')}</header>
+ <section class="lp-hero" id="lp-top"><svg class="lp-contour" viewBox="0 0 600 400" aria-hidden="true" preserveAspectRatio="xMidYMid slice"><g fill="none" stroke="var(--g)" stroke-width="1.2" opacity=".2"><path d="M-20 330C90 300 140 230 230 220s170 50 260 10 110-70 130-70"/><path d="M-20 360C100 330 160 265 240 255s160 55 250 15 120-60 140-60"/><path d="M-20 300C80 270 130 195 225 185s180 45 265 5 100-70 130-70"/><path d="M-20 270C70 240 125 160 220 150s185 40 270 0 95-75 130-75"/><path d="M40 240C100 200 150 120 230 110s190 35 265-5 85-70 120-70"/><path d="M110 190C150 150 190 85 240 75s170 30 240-10"/><path d="M175 140C200 110 225 60 250 50s130 20 190-5"/></g></svg>
+  <div class="lp-copy"><span class="badge g">Безопасность в горах</span>
+   <h1 class="lp-h1">Когда в горах что-то пошло не так, читать статью некогда</h1>
+   <p class="lp-lead">Mountain Safe заранее оценивает риски, а в чрезвычайной ситуации ведёт по шагам, работает без связи и передаёт спасателям точные данные.</p>
+   <div class="row">${b('go','Открыть приложение','pri big2','data-v="home"')}${b('demostart','Смотреть демо ЧС','big2')}</div>
+   <div class="tiny">Без регистрации. Данные остаются на вашем устройстве.</div></div>
+  <div class="lp-phone" aria-hidden="true"><div class="lp-scr"><div class="st-calm" style="font-size:10px">СПОКОЙНО. МЫ ПОМОЖЕМ ТЕБЕ ПОШАГОВО.</div><div class="tiny" style="margin-top:14px">Шаг 3 из 12 · Подозрение на перелом</div><div class="lp-step">Не пытайтесь вправлять конечность.</div><div class="lp-btn">Сделано, дальше</div><div class="row" style="margin-top:14px"><span class="pill" style="font-size:10px;padding:5px 9px"><span class="dot crit"></span>OFFLINE</span><span class="pill" style="font-size:10px;padding:5px 9px">112</span></div></div></div></section>
+ <section class="lp-sec" id="lp-prob"><h2>Что чаще всего приводит к беде</h2><p class="muted lp-p">Опасная ситуация редко возникает из ничего. Обычно это цепочка мелких упущений.</p><div class="chips lp-wrap">${causes.map(c=>`<span class="chip">${c}</span>`).join('')}</div>
+  <p class="lp-p"><b>Принцип продукта:</b> предупредить опасность раньше, чем она станет чрезвычайной ситуацией. А если она всё же наступила, человек не должен ничего искать и решать в одиночку.</p></section>
+ <section class="lp-sec" id="lp-how"><h2>Как работает Stress Mode</h2><div class="grid g3 lp-flow">
+  <div class="card"><span class="badge g">1. Вопросы</span><h3>Шесть коротких вопросов</h3><p class="muted small">Что произошло, есть ли опасность, кто пострадал, может ли двигаться, есть ли связь, где вы.</p></div>
+  <div class="card"><span class="badge g">2. План</span><h3>Один экран — одно действие</h3><p class="muted small">Шаги собираются из ваших ответов: без длинных статей, крупным шрифтом.</p></div>
+  <div class="card"><span class="badge g">3. Сообщение</span><h3>Готово для спасателей</h3><p class="muted small">Что случилось, состояние, координаты, группа и контакт. SMS, «Поделиться» или голосом по 112.</p></div></div></section>
+ <section class="lp-sec" id="lp-levels"><h2>Подстраивается под ваш опыт</h2><p class="muted lp-p">Уровень меняет содержание: количество шагов, глубину советов и инструменты, а не только оформление.</p><div class="grid g2">${lv.map((l,i)=>`<div class="card"><div class="row sp"><h3>${l[0]}</h3><span class="small muted">${l[1]}</span></div><p class="muted small">${l[2]}</p>${b('enterlvl','Начать с этим уровнем','sm','data-v="'+i+'"')}</div>`).join('')}</div></section>
+ <section class="lp-sec" id="lp-feat"><h2>Что внутри</h2><div class="grid g2">${feats.map(f=>`<div class="lp-feat"><span class="ti">${ic(f[0])}</span><div><h3>${f[1]}</h3><p class="muted small">${f[2]}</p></div></div>`).join('')}</div></section>
+ <section class="lp-sec"><h2>Для кого</h2><div class="grid g3">${who.map(w=>`<div class="card flat"><h3>${w[0]}</h3><p class="muted small">${w[1]}</p></div>`).join('')}</div></section>
+ <section class="lp-sec" id="lp-status"><h2>Что готово, а что нет</h2><p class="muted lp-p">Эта страница работает как онлайн-демо. Часть возможностей требует полной версии с сервером.</p><div class="card">${done.map(d=>`<div class="emnum"><span style="flex:1">${d[0]}</span><span class="badge ${d[1].startsWith('Реал')?'g':d[1]==='ДЕМО'?'demo':''}">${d[1]}</span></div>`).join('')}</div></section>
+ <section class="lp-sec"><h2>Куда расти</h2><div class="grid g2"><div class="card flat"><h3>Казахстан</h3><p class="muted small">Маршруты нацпарков и популярных троп, местные номера и протоколы.</p></div><div class="card flat"><h3>Школы и турклубы</h3><p class="muted small">Режимы для групп, отчётность руководителя, обучение.</p></div><div class="card flat"><h3>Спасательные службы</h3><p class="muted small">Приём Emergency Card и отчёта о происшествии.</p></div><div class="card flat"><h3>Международные маршруты</h3><p class="muted small">Локальные номера служб, языки, региональные карты.</p></div></div></section>
+ <section class="lp-cta"><h2>Проверьте, как это ощущается в момент опасности</h2><div class="row" style="justify-content:center">${b('go','Открыть приложение','pri big2','data-v="home"')}${b('demostart','Демо ЧС','big2')}${b('go','Нажать SOS','dng big2','data-v="sos"')}</div></section>
+ <footer class="lp-foot"><p>Mountain Safe помогает принять решение и не заменяет профессиональную медицинскую или спасательную помощь. Рекомендации по первой помощи краткие и общие и требуют проверки врачом или спасательной службой перед реальным применением.</p></footer></div>`}
+
+
+// ===== FILE: public/js/services.js =====
+/* ================= РЕАЛЬНЫЕ СЕРВИСЫ: GPS, погода, карта, GPX, PWA, синхронизация групп ================= */
+
+/* ---------- GPS ---------- */
+const GPS={watch:null};
+const GPS_ERR={1:'Доступ к геолокации запрещён. Разрешите его в настройках браузера.',2:'Позиция недоступна. Выйдите на открытое место.',3:'Не удалось определить позицию вовремя.'};
+function gpsErr(e){toast(GPS_ERR[e&&e.code]||'Геолокация недоступна')}
+function gpsFix(c){
+  const p={lat:c.latitude,lon:c.longitude,acc:Math.round(c.accuracy||0),alt:c.altitude!=null?Math.round(c.altitude):null,ts:Date.now()};
+  S.gps=p;S.card.coords=fmtCoord(p.lat,p.lon);S.card.coordsAt=p.ts;
+  if(S.tracking){const l=S.track[S.track.length-1];if(!l||haversine([l[0],l[1]],[p.lat,p.lon])>=20){S.track.push([p.lat,p.lon,p.ts]);if(S.track.length>1500)S.track=S.track.slice(-1500)}}
+  save();gpsUi();return p}
+function gpsOnce(){return new Promise(res=>{
+  if(!navigator.geolocation){toast('Геолокация не поддерживается этим браузером');return res(null)}
+  navigator.geolocation.getCurrentPosition(pos=>res(gpsFix(pos.coords)),e=>{gpsErr(e);res(null)},{enableHighAccuracy:true,timeout:20000,maximumAge:15000})})}
+function gpsStart(){if(GPS.watch!=null||!navigator.geolocation)return;GPS.watch=navigator.geolocation.watchPosition(pos=>gpsFix(pos.coords),gpsErr,{enableHighAccuracy:true,maximumAge:10000,timeout:30000})}
+function gpsStop(){if(GPS.watch!=null&&navigator.geolocation){navigator.geolocation.clearWatch(GPS.watch)}GPS.watch=null}
+function gpsLine(){const g=S.gps;return g?`${fmtCoord(g.lat,g.lon)} · ±${g.acc} м${g.alt!=null?' · '+g.alt+' м':''} · ${agoTxt(g.ts)}`:'Позиция ещё не определена'}
+function gpsUi(){const el=$('#gpsline');if(el)el.textContent=gpsLine();const co=$('#cardCo');if(co&&document.activeElement!==co&&S.gps)co.value=S.card.coords;if(typeof cardPrev==='function'&&$('#cardprev'))$('#cardprev').innerHTML=cardPrev();mapUpdateMe()}
+async function shareText(t){if(navigator.share){try{await navigator.share({text:t});return}catch(e){if(e&&e.name==='AbortError')return}}copy(t)}
+function smsHref(t){const ph=String(S.card.phone||'').replace(/[^\d+]/g,'');return'sms:'+ph+'?&body='+encodeURIComponent(t)}
+
+/* ---------- погода (Open-Meteo) ---------- */
+const WX_TTL=30*60000,WX_STALE=3*3600000;
+function wxLoc(){
+  if(S.gps&&Date.now()-S.gps.ts<24*3600000)return{lat:S.gps.lat,lon:S.gps.lon,src:'GPS'};
+  const p=parseCoord(S.wxLocText);if(p)return{...p,src:'введено вручную'};
+  const g=S.route.gpx;if(g&&g.pts.length){const m=g.pts[Math.floor(g.pts.length/2)];return{lat:m[0],lon:m[1],src:'середина маршрута'}}
+  return null}
+let wxBusy=false;
+async function wxLoad(silent){
+  if(MS_CONFIG.demoHost){if(!silent)toast('В онлайн-демо реальный прогноз отключён: песочница блокирует внешние запросы. В полной версии он работает.');return}
+  const loc=wxLoc();
+  if(!loc){if(!silent)toast('Нужны координаты: определите GPS, импортируйте GPX или введите вручную');return}
+  if(conn()==='offline'){if(!silent)toast(S.wxLive?'Нет связи: показан сохранённый прогноз':'Нет связи и нет сохранённого прогноза');return}
+  if(wxBusy)return;wxBusy=true;if(!silent)toast('Загружаю прогноз…');
+  const ctl=new AbortController(),to=setTimeout(()=>ctl.abort(),9000);
+  try{
+    const u='https://api.open-meteo.com/v1/forecast?latitude='+loc.lat.toFixed(4)+'&longitude='+loc.lon.toFixed(4)+'&current=temperature_2m,precipitation,wind_speed_10m,weather_code&hourly=temperature_2m,precipitation,wind_speed_10m,visibility,weather_code,cape&forecast_hours=7&wind_speed_unit=kmh&timezone=auto';
+    const r=await fetch(u,{signal:ctl.signal});if(!r.ok)throw new Error('HTTP '+r.status);
+    const w=openMeteoToWx(await r.json());
+    if(!Number.isFinite(w.cur.temp))throw new Error('bad data');
+    S.wxLive={ts:Date.now(),lat:loc.lat,lon:loc.lon,src:loc.src,elev:w.elev,hourly:w.hourly,cur:w.cur};
+    S.wx={sc:'live',...w.cur};save();if(!silent)toast('Прогноз обновлён');
+  }catch(e){if(!silent)toast('Не удалось загрузить прогноз'+(S.wxLive?'. Показан сохранённый':''))}
+  finally{clearTimeout(to);wxBusy=false;if(['weather','home'].includes(S.view))render()}}
+const wxAgeMin=()=>S.wxLive?Math.round((Date.now()-S.wxLive.ts)/60000):null;
+function wxBadge(){if(S.wx.sc==='live'&&S.wxLive){const stale=Date.now()-S.wxLive.ts>WX_STALE;return`<span class="badge ${stale?'demo':'live'}">${stale?'УСТАРЕЛО':'LIVE'}</span>`}return demoB}
+function wxSourceLine(){
+  if(S.wx.sc==='live'&&S.wxLive){const a=wxAgeMin(),stale=Date.now()-S.wxLive.ts>WX_STALE;return`Open-Meteo, ${S.wxLive.src}. Обновлено ${a<1?'только что':a<60?a+' мин назад':Math.round(a/60)+' ч назад'}.${stale?' Прогноз устарел, не опирайтесь на него.':''}`}
+  return(WX_SC[S.wx.sc]?WX_SC[S.wx.sc].n:'Свой сценарий')+'. Демо-данные, не реальный прогноз.'}
+
+/* ---------- GPX ---------- */
+async function gpxImport(file){
+  if(!file)return;if(file.size>6*1048576){toast('Файл больше 6 МБ');return}
+  try{
+    const t=await file.text(),g=parseGpx(t);
+    if(g.pts.length<2){toast('В файле нет трека (нужны точки trkpt или rtept)');return}
+    const st=trackStats(g.pts);
+    S.route.gpx={pts:thin(g.pts,1500),name:g.name||file.name.replace(/\.gpx$/i,''),stats:st};
+    Object.assign(S.route,{name:S.route.gpx.name,dist:st.dist,up:st.up,down:st.down,max:st.max||S.route.max,risks:[],rest:[],exits:[]});
+    save();toast('Маршрут импортирован: '+st.dist+' км');render()
+  }catch(e){toast('Не удалось прочитать GPX')}}
+function routeIsDemo(){return!S.route.gpx}
+
+/* ---------- карта (Leaflet + OpenStreetMap) ---------- */
+let MAP=null,MAPME=null,MAPLAYER=null;
+function mapDestroy(){if(MAP){try{MAP.remove()}catch(e){}}MAP=null;MAPME=null;MAPLAYER=null}
+const MK={risk:'#f28b3c',rest:'#62c48a',exit:'#4c9be8'};
+const mkIcon=c=>L.divIcon({className:'',html:`<div class="mk" style="background:${c}"></div>`,iconSize:[14,14],iconAnchor:[7,7]});
+function mapInit(){
+  const el=$('#map');if(!el||!window.L)return;
+  const g=S.route.gpx;
+  MAP=L.map(el,{zoomControl:true,worldCopyJump:true});
+  if(!MS_CONFIG.demoHost)L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:17,crossOrigin:true,attribution:'© участники OpenStreetMap'}).addTo(MAP);
+  MAPLAYER=L.layerGroup().addTo(MAP);
+  const b=[];
+  if(g){const ll=g.pts.map(p=>[p[0],p[1]]);L.polyline(ll,{color:'#62c48a',weight:4}).addTo(MAPLAYER);b.push(...ll);
+    L.circleMarker(ll[0],{radius:7,color:'#fff',weight:2,fillColor:'#62c48a',fillOpacity:1}).bindTooltip('Старт').addTo(MAPLAYER)}
+  if(S.track.length>1){const tl=S.track.map(p=>[p[0],p[1]]);L.polyline(tl,{color:'#4c9be8',weight:3,dashArray:'6 6'}).addTo(MAPLAYER);b.push(...tl)}
+  [['risk',S.route.risks],['rest',S.route.rest],['exit',S.route.exits]].forEach(([ty,arr])=>arr.forEach(x=>{if(x.lat!=null){L.marker([x.lat,x.lon],{icon:mkIcon(MK[ty])}).bindTooltip(E(x.t)).addTo(MAPLAYER);b.push([x.lat,x.lon])}}));
+  if(S.gps)b.push([S.gps.lat,S.gps.lon]);
+  if(b.length)MAP.fitBounds(L.latLngBounds(b).pad(.15),{maxZoom:15});else MAP.setView([43.24,76.95],9);
+  MAP.on('click',e=>{if(!S.addMode)return;const ty=S.addMode,txt=($('#npX')&&$('#npX').value.trim())||({risk:'Точка риска',rest:'Точка отдыха',exit:'Точка выхода'})[ty];
+    const pt={t:txt,lat:+e.latlng.lat.toFixed(5),lon:+e.latlng.lng.toFixed(5),k:null};
+    if(g){const n=nearestKm(g.pts,pt.lat,pt.lon);pt.k=n.km}
+    const arr={risk:S.route.risks,rest:S.route.rest,exit:S.route.exits}[ty];arr.push(pt);save();render()});
+  mapUpdateMe();
+}
+function mapUpdateMe(){if(!MAP||!S.gps)return;const ll=[S.gps.lat,S.gps.lon];
+  if(MAPME){MAPME.setLatLng(ll)}else{MAPME=L.circleMarker(ll,{radius:8,color:'#fff',weight:3,fillColor:'#2f7bd8',fillOpacity:1}).bindTooltip('Вы здесь').addTo(MAP)}}
+function tileUrl(z,x,y){return'https://tile.openstreetmap.org/'+z+'/'+x+'/'+y+'.png'}
+async function mapCacheView(){
+  if(!MAP)return;if(conn()==='offline'){toast('Нет связи: сохранить карту нельзя');return}
+  const z=MAP.getZoom(),b=MAP.getBounds(),n=Math.pow(2,z);
+  const tx=lon=>Math.floor((lon+180)/360*n),ty=lat=>{const r=lat*Math.PI/180;return Math.floor((1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*n)};
+  const x0=tx(b.getWest()),x1=tx(b.getEast()),y0=ty(b.getNorth()),y1=ty(b.getSouth()),cnt=(x1-x0+1)*(y1-y0+1);
+  if(cnt>60){toast('Область велика ('+cnt+' плиток). Приблизьте карту: можно сохранить до 60 плиток за раз');return}
+  toast('Сохраняю '+cnt+' плиток…');let ok=0;
+  for(let x=x0;x<=x1;x++)for(let y=y0;y<=y1;y++){try{const r=await fetch(tileUrl(z,((x%n)+n)%n,y),{mode:'cors'});if(r.ok)ok++}catch(e){}}
+  toast('Карта сохранена офлайн: '+ok+' из '+cnt+' плиток');pwaRefresh()}
+function afterRender(){if(S.view==='route')mapInit();if(S.view==='group'&&SRV===null)srvCheck().then(()=>{if(S.view==='group')render()})}
+
+/* ---------- PWA ---------- */
+const PWA={cached:0,tiles:0,persisted:null,sw:'none',waiting:null,install:null};
+window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();PWA.install=e;if(S.view==='offline')render()});
+window.addEventListener('appinstalled',()=>{PWA.install=null;toast('Приложение установлено')});
+const isStandalone=()=>window.matchMedia&&(matchMedia('(display-mode: standalone)').matches||navigator.standalone);
+async function pwaRefresh(){
+  try{
+    PWA.sw=navigator.serviceWorker&&navigator.serviceWorker.controller?'active':(PWA.sw==='installing'?'installing':'none');
+    if(window.caches){for(const k of await caches.keys()){const c=await caches.open(k),n=(await c.keys()).length;if(k.startsWith('ms-tiles'))PWA.tiles=n;else if(k.startsWith('ms-'))PWA.cached=n}}
+    if(navigator.storage&&navigator.storage.persisted)PWA.persisted=await navigator.storage.persisted();
+  }catch(e){}
+  if(S.view==='offline')render()}
+function updateBar(){$('#updatebar').innerHTML=PWA.waiting?`<div class="update-bar"><b class="small" style="flex:1">Доступна новая версия приложения</b><button class="btn sm pri" data-a="pwaupdate">Обновить</button></div>`:''}
+function pwaInit(){
+  if(!('serviceWorker' in navigator)||!/^https?:$/.test(location.protocol))return;
+  navigator.serviceWorker.register('sw.js').then(reg=>{
+    PWA.sw=navigator.serviceWorker.controller?'active':'installing';
+    if(reg.waiting&&navigator.serviceWorker.controller){PWA.waiting=reg.waiting;updateBar()}
+    reg.addEventListener('updatefound',()=>{const w=reg.installing;if(!w)return;w.addEventListener('statechange',()=>{if(w.state==='installed'&&navigator.serviceWorker.controller){PWA.waiting=w;updateBar()}if(w.state==='activated')pwaRefresh()})});
+    pwaRefresh();
+  }).catch(()=>{PWA.sw='none'});
+  let reloading=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(reloading)return;reloading=true;if(PWA.hadController)location.reload();PWA.hadController=true;pwaRefresh()});
+  PWA.hadController=!!navigator.serviceWorker.controller;
+}
+
+/* ---------- онлайн-группы: клиент ---------- */
+let SRV=null; // null = не проверяли, true/false
+async function srvCheck(){if(MS_CONFIG.demoHost){SRV=false;return false}try{const r=await fetch('api/health',{cache:'no-store'});SRV=r.ok&&(r.headers.get('content-type')||'').includes('json')}catch(e){SRV=false}return SRV}
+const hdr=()=>({'Content-Type':'application/json',Authorization:'Bearer '+S.sync.token});
+const Y=()=>S.sync;
+async function gCreate(name,leaderName,mode){
+  const r=await fetch('api/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,leaderName,mode,level:S.level})});
+  const j=await r.json();if(!r.ok)throw new Error(j.error||'error');
+  S.sync={...DEF().sync,code:j.code,role:'leader',memberId:j.memberId,token:j.leaderToken,name:leaderName};save();await gPull()}
+async function gJoin(code,name){
+  const r=await fetch('api/groups/'+encodeURIComponent(code.toUpperCase())+'/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,level:S.level})});
+  const j=await r.json();if(!r.ok)throw new Error(r.status===404?'Группа с таким кодом не найдена':(j.error||'error'));
+  S.sync={...DEF().sync,code:code.toUpperCase(),role:'member',memberId:j.memberId,token:j.memberToken,name};save();await gPull()}
+function gLeave(){S.sync={...DEF().sync};save();render()}
+function ageMs(m){const d=Y().data;if(!d)return 0;return Math.max(0,(d.serverNow-m.reportAt)+(Date.now()-Y().lastPull))}
+const STALE_MS=10*60000;
+function effStatus(m){return ageMs(m)>STALE_MS&&m.status==='ok'?'nocomm':m.status}
+async function gPull(){
+  const y=Y();if(!y.code||conn()==='offline')return;
+  try{
+    const r=await fetch('api/groups/'+y.code,{headers:hdr(),cache:'no-store'});
+    if(r.status===404||r.status===401){y.error='Группа недоступна: удалена или доступ отозван';save();if(S.view==='group')render();return}
+    if(!r.ok)return;
+    y.data=await r.json();y.lastPull=Date.now();y.error='';save();gAlerts();
+    if(S.view==='group'&&!document.activeElement.matches('input,textarea,select'))render();
+    renderShell()
+  }catch(e){}}
+async function gFlush(){
+  const y=Y();if(!y.code||!y.queue.length||conn()==='offline')return;
+  try{const r=await fetch('api/groups/'+y.code+'/report',{method:'POST',headers:hdr(),body:JSON.stringify({reports:y.queue})});if(r.ok){y.queue=[];save()}}catch(e){}}
+function gReport(extra={}){
+  const y=Y();if(!y.code)return;
+  const rep={status:y.myStatus,comm:conn()==='online'?'ok':conn()==='weak'?'weak':'none',ts:Date.now(),...extra};
+  const forced=rep.status==='emergency'||rep.status==='help';
+  if(S.gps&&(y.shareLoc||forced)&&Date.now()-S.gps.ts<10*60000){rep.lat=S.gps.lat;rep.lon=S.gps.lon;rep.acc=S.gps.acc}
+  y.queue.push(rep);if(y.queue.length>50)y.queue=y.queue.slice(-50);save();return gFlush().then(()=>gPull())}
+function gSetStatus(st){Y().myStatus=st;if(st!=='ok')gpsOnce().finally(()=>gReport());else gReport();save();if(S.view==='group')render()}
+async function gCheckin(){try{const r=await fetch('api/groups/'+Y().code+'/checkin',{method:'POST',headers:hdr(),body:'{}'});if(r.ok){await gPull();toast('Запрос отметки отправлен всем')}}catch(e){toast('Нет связи с сервером')}}
+async function gRemove(id){try{await fetch('api/groups/'+Y().code+'/remove',{method:'POST',headers:hdr(),body:JSON.stringify({memberId:id})});await gPull()}catch(e){}}
+function gAlerts(){
+  const d=Y().data;if(!d)return;
+  d.members.forEach(m=>{if(m.id===Y().memberId)return;const k=m.id+':'+m.status+':'+m.reportAt;
+    if((m.status==='emergency'||m.status==='help')&&!Y().seenEm[m.id+m.status]){Y().seenEm[m.id+m.status]=1;toast((m.status==='emergency'?'EMERGENCY: ':'Нужна помощь: ')+m.name);try{navigator.vibrate&&navigator.vibrate([300,150,300])}catch(e){}}
+    if(m.status==='ok'){delete Y().seenEm[m.id+'emergency'];delete Y().seenEm[m.id+'help']}})}
+function syncBanner(){
+  const y=Y();if(!y.code||!y.data)return'';
+  const em=y.data.members.filter(m=>m.id!==y.memberId&&(m.status==='emergency'||m.status==='help'));
+  let h='';
+  if(em.length)h+=`<div class="dngbox" style="margin-bottom:8px"><b>${em.some(m=>m.status==='emergency')?'EMERGENCY':'Нужна помощь'}:</b> ${em.map(m=>E(m.name)).join(', ')} <button class="btn sm dng" data-a="go" data-v="group">Открыть группу</button></div>`;
+  if(y.role!=='leader'&&y.data.checkinAt>y.ackedAt)h+=`<div class="warnbox" style="margin-bottom:8px"><b>Руководитель запросил отметку.</b> <button class="btn sm pri" data-a="gack">Я на месте</button></div>`;
+  return h}
+function syncTick(){const y=Y();if(!y.code)return;gFlush().then(()=>gPull());if(y.role&&Date.now()-(y.lastHb||0)>60000){y.lastHb=Date.now();gReport()}}
+setInterval(syncTick,30000);
+window.addEventListener('online',()=>{gFlush().then(gPull);wxLoad(true)});
+
+/* ---------- запуск ---------- */
+function boot(){
+  const q=new URLSearchParams(location.search).get('go');
+  if(q&&VIEWS[q]){S.view=q}
+  else if(!S.entered&&!isStandalone()&&!/source=pwa/.test(location.search))S.view='landing';
+  pwaInit();
+  if(S.tracking)gpsStart();
+  if(S.sync.code)syncTick();
+  if(S.wxLive&&conn()!=='offline'&&Date.now()-S.wxLive.ts>WX_TTL)wxLoad(true);
+}
+
+
+// ===== FILE: public/js/views.js =====
+/* ================= PREP ================= */
+function prepWarns(){const w=[],vis=prepVis(),rk=wxRisk(S.wx),rc=routeCalc(S.route);
+ const miss=vis.filter(p=>p.crit&&!S.prep[p.id]).map(p=>p.t);
+ if(miss.length)w.push('Не отмечено важное: '+miss.join('; ')+'.');
+ if(rk.l>=2&&!S.prep.rain)w.push('Погода (ДЕМО) тяжёлая, а дождевик не отмечен.');
+ if(rc.h>6&&!S.prep.light)w.push('Маршрут долгий ('+hm(rc.h)+'): возьмите фонарик на случай темноты.');
+ if(S.prep.charge&&!S.prep.pb&&rc.h>5)w.push('Долгий маршрут без powerbank: заряд может закончиться.');
+ return w}
+function vPrep(){const vis=prepVis(),pct=prepPct(),warns=prepWarns(),gs=[...new Set(vis.map(p=>p.g))];
+ const lab=pct>=100?'Чек-лист выполнен':pct>=70?'Почти готовы':'Подготовка неполная';
+ return`${head('Подготовка к походу','Отметьте, что готово. Список зависит от вашего уровня: '+lvName()+'.')}
+ <div class="card"><div class="row sp"><div><div class="sect-t">Готовность к походу</div><h2 style="font-size:34px">${pct}%</h2></div><span class="badge g">${lab}</span></div><div class="bar" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct}%"></i></div>
+ <div class="small muted">Готовность считает только ваш чек-лист. ${pct>=100?'Даже 100% не означает, что поход безопасен: условия в горах меняются. Оценивайте погоду и состояние группы по ходу маршрута.':'Заполните критичные пункты (оранжевая рамка).'}</div></div>
+ ${warns.length?`<div class="warnbox"><b>Умная проверка</b><ul style="margin:6px 0 0;padding-left:18px">${warns.map(x=>`<li>${E(x)}</li>`).join('')}</ul></div>`:''}
+ ${gs.map(g=>`<div class="col"><div class="sect-t">${g}</div>${vis.filter(p=>p.g===g).map(p=>`<button class="chk ${S.prep[p.id]?'on':''} ${p.crit?'crit':''}" data-a="prept" data-id="${p.id}" role="checkbox" aria-checked="${!!S.prep[p.id]}"><span class="bx">✓</span><span>${E(p.t)}${p.why?`<small>${E(p.why)}</small>`:''}</span></button>`).join('')}</div>`).join('')}
+ <button class="btn ghost" data-a="prepreset">Сбросить отметки</button>`}
+
+/* ================= ROUTE ================= */
+function elevProfile(r){const g=r.gpx;if(g&&g.stats.hasEle&&g.stats.profile.length>1)return g.stats.profile.filter(p=>p[1]!=null);const n=DEMO_ELEV.length;return DEMO_ELEV.map((v,i)=>[i/(n-1)*r.dist,v])}
+function elevSvg(r){const P=elevProfile(r),W=360,H=150,pl=38,pr=10,pt=12,pb=24,total=P[P.length-1][0]||1,ys=P.map(p=>p[1]),mn=Math.min(...ys),mx=Math.max(...ys),iw=W-pl-pr,ih=H-pt-pb,rg=(mx-mn)||1;
+ const X=k=>pl+k/total*iw,Y=v=>pt+ih-(v-mn)/rg*ih;
+ const yAt=k=>{for(let i=1;i<P.length;i++)if(P[i][0]>=k){const a=P[i-1],b=P[i],f=(k-a[0])/((b[0]-a[0])||1);return a[1]+(b[1]-a[1])*f}return P[P.length-1][1]};
+ const pts=P.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ');
+ const mk=r.risks.filter(x=>x.k!=null&&x.k<=total).map(x=>`<line x1="${X(x.k)}" x2="${X(x.k)}" y1="${pt}" y2="${pt+ih}" stroke="var(--hi)" stroke-dasharray="3 3" stroke-width="1.2"/><circle cx="${X(x.k)}" cy="${Y(yAt(x.k))}" r="4.5" fill="var(--hi)"/>`).join('');
+ return`<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Профиль высоты"><line x1="${pl}" x2="${W-pr}" y1="${pt+ih}" y2="${pt+ih}" stroke="var(--line)"/><line x1="${pl}" x2="${W-pr}" y1="${pt}" y2="${pt}" stroke="var(--line)" stroke-dasharray="2 4"/><polygon points="${pl},${pt+ih} ${pts} ${pl+iw},${pt+ih}" fill="var(--gs)"/><polyline points="${pts}" fill="none" stroke="var(--g)" stroke-width="2.4" stroke-linejoin="round"/>${mk}<text x="${pl-6}" y="${pt+4}" text-anchor="end" font-size="10">${Math.round(mx)}</text><text x="${pl-6}" y="${pt+ih+3}" text-anchor="end" font-size="10">${Math.round(mn)}</text><text x="${pl}" y="${H-6}" font-size="10">0 км</text><text x="${W-pr}" y="${H-6}" font-size="10" text-anchor="end">${(+total).toFixed(1)} км</text></svg>`}
+function trackInfo(){const t=S.track;if(t.length<2)return'След ещё не записан. Включите запись пути: по нему можно вернуться назад.';let d=0;for(let i=1;i<t.length;i++)d+=haversine(t[i-1],t[i]);const s=t[0],me=S.gps?Math.round(haversine([s[0],s[1]],[S.gps.lat,S.gps.lon])):null;return`След: ${t.length} точек, ${(d/1000).toFixed(1)} км. Точка старта следа: ${fmtCoord(s[0],s[1])}${me!=null?' ('+(me>=1000?(me/1000).toFixed(1)+' км':me+' м')+' по прямой от вас)':''}.`}
+function vRoute(){const r=S.route,c=routeCalc(r),lv=S.level,d=DIFF[c.d],back=addTime(r.start,c.h*1.25),demo=routeIsDemo();
+ const sm=(a,b)=>{const [h1,m1]=a.split(':').map(Number),[h2,m2]=b.split(':').map(Number);return(h2*60+m2)-(h1*60+m1)};
+ const buf=sm(back,r.sunset);
+ const inp=(l,p,t='number')=>`<label class="f">${l}<input type="${t}" ${t==='number'?'inputmode="decimal" data-n':''} data-i="route.${p}" data-r value="${E(r[p])}"></label>`;
+ const pt=x=>(x.k!=null?x.k+' км':'')+(x.lat!=null?(x.k!=null?' · ':'')+fmtCoord(x.lat,x.lon):'');
+ const listPts=(arr,ty,icn)=>arr.map((x,i)=>`<div class="emnum"><span>${icn}</span><b class="mono" style="font-size:13px;min-width:60px">${pt(x)}</b><span style="flex:1">${E(x.t)}</span>${lv>=1?`<button class="btn sm ghost" data-a="delpt" data-ty="${ty}" data-k="${i}" aria-label="Удалить">✕</button>`:''}</div>`).join('')||'<div class="muted small">Нет точек</div>';
+ return`${head('Маршрут','Импортируйте трек GPX, смотрите карту, отмечайте точки риска.',demo?demoB:'<span class="badge live">GPX</span>')}
+ ${demo?'<div class="warnbox">Показан пример маршрута (ДЕМО). Загрузите свой GPX-файл: дистанция, набор высоты и профиль посчитаются по нему.</div>':''}
+ <div class="card"><div class="row"><label class="btn pri" for="gpxIn">Импортировать GPX</label><input id="gpxIn" class="hidden-file" type="file" accept=".gpx,application/gpx+xml,text/xml,application/xml">${demo?'':'<button class="btn" data-a="routedemo">Вернуться к примеру</button>'}</div><div class="tiny">Файл читается на вашем устройстве и никуда не отправляется.</div></div>
+ <div class="card"><div class="grid g2">${inp('Название','name','text')}${inp('Дистанция, км','dist')}${inp('Набор высоты, м','up')}${inp('Максимальная высота, м','max')}${inp('Старт (чч:мм)','start','text')}${inp('Закат (чч:мм)','sunset','text')}</div><div class="tiny">Время заката введите из календаря: приложение не вычисляет его само.</div></div>
+ <div class="grid g2">
+  <div class="risk tone-${d.c}"><span class="dot ${d.c}"></span><div><div class="sect-t">Сложность</div><b style="font-size:20px">${d.t}</b><div class="small muted">Оценка по дистанции, набору и высоте. Ориентир, не гарантия.</div></div></div>
+  <div class="card"><div class="sect-t">Время в пути</div><h2>${hm(c.h)}</h2><div class="small muted">~4 км/ч + 500 м подъёма в час. Реальное время зависит от группы.</div></div>
+ </div>
+ <div class="card"><div class="sect-t">План возвращения</div><div class="row sp"><div>Старт <b class="mono">${E(r.start)}</b></div><div>Вернуться ориентировочно к <b class="mono">${back}</b></div><div>Закат <b class="mono">${E(r.sunset)}</b></div></div>
+ ${buf<60?`<div class="dngbox">До заката меньше часа после ожидаемого возвращения. Стартуйте раньше или сократите маршрут.</div>`:`<div class="small muted">Запас до заката: ${Math.floor(buf/60)} ч ${buf%60} мин (с запасом 25% ко времени пути).</div>`}</div>
+ <div class="card"><div class="row sp"><div class="sect-t">Карта</div><span class="small mono" id="gpsline">${gpsLine()}</span></div><div id="map" class="map" role="application" aria-label="Карта маршрута"></div>
+  <div class="row"><button class="btn sm" data-a="gpsnow">Моя позиция</button><button class="btn sm ${S.tracking?'pri':''}" data-a="track">${S.tracking?'Запись пути: вкл':'Запись пути: выкл'}</button><button class="btn sm" data-a="cachemap">Сохранить область офлайн</button></div>
+  ${lv>=2?`<div class="row"><span class="small muted">Поставить точку касанием карты:</span>${[['','Выкл'],['risk','Риск'],['rest','Отдых'],['exit','Выход']].map(o=>`<button class="chip ${S.addMode===o[0]?'on':''}" data-a="addmode" data-v="${o[0]}">${o[1]}</button>`).join('')}</div><input id="npX" placeholder="Описание точки (необязательно)">`:''}
+  <div class="tiny">${MS_CONFIG.demoHost?'В онлайн-демо подложка карты отключена (нужен доступ к серверу плиток), трек и точки показываются. ':''}${E(trackInfo())} Карта: © участники OpenStreetMap. Офлайн доступны только просмотренные и сохранённые области.</div></div>
+ ${lv>=1?`<div class="card"><div class="row sp"><div class="sect-t">Профиль высоты</div>${demo?demoB:''}</div>${elevSvg(r)}<div class="tiny">Оранжевые точки: риски на маршруте.</div></div>`:''}
+ <div class="card"><div class="sect-t">Точки риска</div>${listPts(r.risks,'risk','⚠️')}</div>
+ ${lv>=1?`<div class="grid g2"><div class="card"><div class="sect-t">Точки отдыха</div>${listPts(r.rest,'rest','🟢')}</div><div class="card"><div class="sect-t">Точки выхода</div>${listPts(r.exits,'exit','🚪')}</div></div>
+ <div class="card"><label class="f">Запасной маршрут<textarea data-i="route.alt">${E(r.alt)}</textarea></label></div>`:''}
+ ${lv>=2?`<div class="card"><div class="sect-t">Добавить точку по километру</div><div class="grid g2"><label class="f">Тип<select id="npT"><option value="risk">Риск</option><option value="rest">Отдых</option><option value="exit">Выход</option></select></label><label class="f">Километр<input id="npK" type="number" inputmode="decimal" placeholder="5.5"></label></div><label class="f">Описание<input id="npY" placeholder="Например: осыпь, крутой склон, брод"></label><button class="btn pri" data-a="addpt">Добавить</button></div>`:`<div class="tiny">Добавление точек, запасной маршрут и профиль высоты открываются с уровня AVERAGE и ADVANCED.</div>`}`}
+
+/* ================= WEATHER ================= */
+function hourly(){const b=S.wx;
+ if(b.sc==='live'&&S.wxLive)return S.wxLive.hourly.map(x=>({h:x.h,w:x.w,r:wxRisk(x.w)}));
+ const tr=(WX_SC[b.sc]||{}).tr||{temp:0,wind:0,rain:0,storm:0},now=new Date(),o=[];
+ for(let h=0;h<6;h++){const w={temp:Math.round(b.temp+tr.temp*h),wind:Math.max(0,Math.round(b.wind+tr.wind*h)),rain:Math.max(0,b.rain+tr.rain*h*.5),storm:Math.min(100,Math.max(0,Math.round(b.storm+tr.storm*h))),vis:Math.max(.2,b.vis-(tr.wind>2?h*.8:0))};o.push({h:(now.getHours()+h)%24,w,r:wxRisk(w)})}return o}
+function wxAdvice(l){const ex=S.level>=2;return[[ 'Условия благоприятны. Возьмите тёплый слой и следите за небом.','Условия в норме. Сверяйте прогноз на привалах и держите время разворота.'],['Идите недалеко и будьте готовы вернуться.','Сократите маршрут, определите точку разворота, ужесточите контроль группы.'],['Лучше не идти или вернуться. Не поднимайтесь выше.','Рекомендуется отказаться от выхода или перейти на запасной маршрут ниже. Сократите контрольные интервалы.'],['Не идите в горы. Если вы на маршруте: спускайтесь и ищите укрытие.','Критические условия. Сверните выход, спуститесь в безопасную зону, уведомите контакт.']][l][ex?1:0]}
+function wxResult(){const w=S.wx,k=wxRisk(w),R=RISK[k.l],lv=S.level,h=hourly();
+ return`<div class="risk tone-${R.c}"><span class="dot ${R.c}" style="width:16px;height:16px"></span><div><b style="font-size:20px">${R.t}</b><div class="small">${wxAdvice(k.l)}</div></div></div>
+ <div class="grid g3">${[['Температура',w.temp+'°C'],['Ветер',w.wind+' км/ч'],['Осадки',(+w.rain).toFixed(1)+' мм/ч'],['Гроза',w.storm+'%'],['Видимость',(+w.vis).toFixed(1)+' км']].map(x=>`<div class="stat"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('')}</div>
+ ${k.r.length?`<div class="card flat"><div class="sect-t">Предупреждения</div>${k.r.map(x=>`<div class="dont" style="background:color-mix(in srgb,var(--warn) 14%,var(--card))">${E(x)}</div>`).join('')}</div>`:'<div class="card flat small muted">Предупреждений нет.</div>'}
+ ${lv>=1?`<div class="card"><div class="row sp"><div class="sect-t">Ближайшие 6 часов</div>${wxBadge()}</div><div class="grid" style="grid-template-columns:repeat(6,minmax(0,1fr));gap:6px">${h.map(x=>`<div class="stat" style="align-items:center;padding:10px 4px;text-align:center"><span>${String(x.h).padStart(2,'0')}:00</span><b style="font-size:15px">${x.w.temp}°</b><span style="letter-spacing:0">${x.w.wind} км/ч</span><span class="dot ${RISK[x.r.l].c}"></span></div>`).join('')}</div></div>`:''}
+ ${lv>=2?`<div class="card flat small muted"><b>Как считается риск (упрощённая модель):</b> ветер ≥30 км/ч +2, ≥50 +3; гроза ≥30% +2, ≥60% +3; осадки ≥1 мм/ч +1, ≥5 +2; видимость &lt;5 км +2, &lt;1 км +3; температура ≤5°C +1, ≤0 +2, ≥28 +1, ≥32 +2. Сумма ${k.s}: 0–1 низкий, 2–3 внимание, 4–5 высокий, 6+ критический. Для решений опирайтесь на официальные прогнозы.</div>`:''}`}
+function vWeather(){const sl=(l,p,mn,mx,st)=>`<label class="f"><span class="row sp"><span>${l}</span><output class="mono">${S.wx[p]}</output></span><input type="range" min="${mn}" max="${mx}" step="${st}" value="${S.wx[p]}" data-i="wx.${p}" data-n data-live="wx"></label>`;
+ const loc=wxLoc(),off=conn()==='offline',live=S.wx.sc==='live'&&S.wxLive;
+ return`${head('Погода и риски','Понятная оценка риска по температуре, ветру, осадкам, грозе и видимости.',wxBadge())}
+ ${live?`<div class="card flat small muted">${E(wxSourceLine())} Высота расчётной точки: ${S.wxLive.elev!=null?Math.round(S.wxLive.elev)+' м':'н/д'}. Вероятность грозы оценивается по коду погоды и энергии конвекции (CAPE), это не официальный показатель. Погода в горах локально отличается: сверяйтесь с официальным прогнозом.</div>`:'<div class="warnbox">Сейчас показан ДЕМО-сценарий. Загрузите реальный прогноз для вашей точки.</div>'}
+ <div class="card"><div class="sect-t">Реальный прогноз (Open-Meteo)</div>
+  <div class="small muted">Точка: ${loc?fmtCoord(loc.lat,loc.lon)+' ('+loc.src+')':'не определена'}</div>
+  <label class="f">Координаты вручную<input data-i="wxLocText" placeholder="43.24, 76.95" value="${E(S.wxLocText)}"></label>
+  <div class="row"><button class="btn pri" data-a="wxload" ${off?'disabled':''}>${off?'Нет связи':'Загрузить прогноз'}</button><button class="btn" data-a="wxgps" ${off?'disabled':''}>По моему GPS</button></div>
+  <div class="tiny">Прогноз сохраняется на устройстве и показывается без сети с пометкой возраста. Данные: Open-Meteo.com (CC BY 4.0).</div></div>
+ <div class="chips" id="wxchips">${wxChips()}</div>
+ <div id="wxres" class="col">${wxResult()}</div>
+ <details class="memo-d"><summary>ДЕМО-сценарии: настроить значения вручную</summary><div><div class="grid g2">${sl('Температура, °C','temp',-15,40,1)}${sl('Ветер, км/ч','wind',0,90,1)}${sl('Осадки, мм/ч','rain',0,15,.5)}${sl('Вероятность грозы, %','storm',0,100,5)}${sl('Видимость, км','vis',.2,30,.2)}</div></div></details>`}
+const wxChips=()=>(S.wxLive?`<button class="chip ${S.wx.sc==='live'?'on':''}" data-a="wxsc" data-v="live">Реальный</button>`:'')+Object.keys(WX_SC).map(k=>`<button class="chip ${S.wx.sc===k?'on':''}" data-a="wxsc" data-v="${k}">ДЕМО: ${WX_SC[k].n}</button>`).join('')+(S.wx.sc==='custom'?'<span class="chip on">Свой сценарий</span>':'');
+function setWx(k){const s=WX_SC[k];S.wx={sc:k,temp:s.temp,wind:s.wind,rain:s.rain,storm:s.storm,vis:s.vis};save()}
+const LIVE={
+ wx(el){S.wx.sc='custom';$('#wxres').innerHTML=wxResult();$('#wxchips').innerHTML=wxChips();const o=el.parentElement.querySelector('output');if(o)o.textContent=el.value;renderShell()},
+ what(el){whatQ=el.value;$('#whatres').innerHTML=whatRes()},
+ card(){$('#cardprev').innerHTML=cardPrev()}
+};
+
+/* ================= MEMOS / AID ================= */
+let memoCat='before';
+const CATS=[['before','Перед походом'],['during','Во время похода'],['emergency','ЧС'],['firstaid','Первая помощь']];
+function memoBlock(t,steps,extra){return`<details class="memo-d"><summary>${E(t)}</summary><div><ol class="steps">${steps.map(s=>`<li>${E(s)}</li>`).join('')}</ol>${extra.length?`<div class="sect-t">Для вашего уровня</div><ol class="steps">${extra.map(s=>`<li class="adv">${E(s)}</li>`).join('')}</ol>`:''}</div></details>`}
+function vMemos(){const lv=S.level;let list=[],hidden=0;
+ if(memoCat==='firstaid')list=AID_ORDER.map(id=>({t:INC[id].t,inc:id}));
+ else{const all=MEMOS.filter(m=>m.c===memoCat);list=all.filter(m=>(m.min||0)<=lv);hidden=all.length-list.length}
+ const blocks=list.map(m=>{if(m.inc){const I=INC[m.inc];return memoBlock(m.t,I.steps,lv>=2?I.adv:[])}
+  const ex=[...(lv>=1&&m.pro?m.pro:[]),...(lv>=3&&m.exp?m.exp:[])];return memoBlock(m.t,m.s,ex)}).join('');
+ return`${head('Памятки','Короткие карточки. Чем выше уровень, тем больше деталей.')}
+ <div class="chips">${CATS.map(c=>`<button class="chip ${memoCat===c[0]?'on':''}" data-a="memocat" data-v="${c[0]}">${c[1]}</button>`).join('')}</div>
+ <div class="memo">${blocks}</div>${hidden?`<div class="tiny">Ещё ${hidden} памятк${hidden>1?'и':'а'} откроется на более высоком уровне.</div>`:''}
+ ${memoCat==='firstaid'?'<button class="btn" data-a="go" data-v="aid">Открыть раздел «Первая помощь»</button>':''}`}
+function vAid(){return`${head('Первая помощь','Порядок всегда один: безопасность, сознание, дыхание, кровотечение, вызов помощи.')}
+ <div class="chips">${['Безопасность','Сознание','Дыхание','Кровотечение','Вызов помощи'].map((t,i)=>`<span class="chip on" style="background:var(--card);color:var(--tx);border-color:var(--line)"><b class="num" style="color:var(--g)">${i+1}</b> ${t}</span>`).join('')}</div>
+ <div class="grid g3">${AID_ORDER.map(id=>`<button class="inc" data-a="incgo" data-id="${id}"><span class="em">${INC[id].em}</span><b>${INC[id].t}</b></button>`).join('')}</div>
+ <div class="warnbox">Помощь в горах может занять часы. Не уверены или состояние тяжёлое: звоните 112 и следуйте указаниям диспетчера.</div>${numsCard()}`}
+
+/* ================= CHECK ================= */
+let checkMode='quick';
+function vCheck(){
+ const q=QUICK6.map((t,i)=>`<button class="chk ${S.quick[i]?'on':''}" data-a="qtoggle" data-k="${i}" role="checkbox" aria-checked="${!!S.quick[i]}"><span class="bx">✓</span><span><b>${t}</b></span></button>`).join('');
+ const missing=QUICK6.filter((t,i)=>!S.quick[i]);
+ const ext=CHECKSETS.map(cs=>{const st=S.checks[cs.id]||{},n=cs.items.filter((_,i)=>st[i]).length;return`<div class="card"><div class="row sp"><h3>${cs.t}</h3><span class="badge ${n===cs.items.length?'g':''}">${n}/${cs.items.length}</span></div>${cs.items.map((t,i)=>`<button class="chk ${st[i]?'on':''}" data-a="cktoggle" data-id="${cs.id}" data-k="${i}" role="checkbox" aria-checked="${!!st[i]}"><span class="bx">✓</span><span>${E(t)}</span></button>`).join('')}<button class="btn sm ghost" data-a="ckreset" data-id="${cs.id}">Сбросить</button></div>`}).join('');
+ return`${head('Я знаю, но хочу проверить','Профессиональные памятки без базовых объяснений.')}
+ <div class="chips"><button class="chip ${checkMode==='quick'?'on':''}" data-a="ckmode" data-v="quick">Быстрая проверка</button><button class="chip ${checkMode==='ext'?'on':''}" data-a="ckmode" data-v="ext">Списки для групп</button></div>
+ ${checkMode==='quick'?`<div class="card"><div class="row sp"><h3>10 секунд перед выходом</h3><button class="btn sm ghost" data-a="qreset">Сбросить</button></div><div class="grid g2">${q}</div>
+ ${missing.length?`<div class="warnbox"><b>Не подтверждено:</b> ${missing.join(', ')}.</div>`:`<div class="risk tone-ok"><span class="dot ok"></span><div><b>Ключевое подтверждено.</b><div class="small muted">Это не гарантия безопасности. Продолжайте оценивать условия по ходу.</div></div></div>`}</div>`:ext}`}
+
+/* ================= GROUP ================= */
+const MODES={school:['Школьная группа','Считайте по списку на старте, на каждом привале и на финише. Рядом должен быть ответственный взрослый.'],family:['Семья','Дети всегда в зоне видимости. Назначьте каждому ребёнку взрослого-напарника. Договоритесь: потерялся — стой на месте и зови.'],club:['Турклуб','Назначьте ведущего и замыкающего, договоритесь о сигналах и контрольных временах связи.']};
+const LOGT={info:'Инфо',injury:'Травма',weather:'Погода',comm:'Связь',decision:'Решение',sos:'SOS'};
+function vGroupLocal(){const g=S.group,lv=S.level,cnt={ok:0,help:0,emergency:0,nocomm:0};g.members.forEach(m=>cnt[m.st]++);
+ const bad=g.members.filter(m=>m.st==='nocomm'||m.st==='emergency'||m.comm==='none');
+ const mem=g.members.map(m=>{const s=STATUS[m.st],stale=Date.now()-m.seen>15*60000;return`<div class="member"><div><div class="nm">${E(m.n)} <span class="badge">${LEVELS[m.lv].k}</span></div><div class="tiny">Подтверждён: <span style="color:${stale?'var(--hi)':'inherit'}">${agoTxt(m.seen)}</span>${m.med?' · Заметка: '+E(m.med):''}</div></div><span class="pill"><span class="dot ${s.c}"></span>${s.t}</span>
+  <label class="f"><span class="tiny">Статус</span><select data-sel="mstat" data-id="${m.id}">${Object.keys(STATUS).map(k=>`<option value="${k}" ${m.st===k?'selected':''}>${STATUS[k].t}</option>`).join('')}</select></label>
+  <label class="f"><span class="tiny">Связь</span><select data-sel="mcomm" data-id="${m.id}">${[['ok','Есть'],['weak','Слабая'],['none','Нет']].map(o=>`<option value="${o[0]}" ${m.comm===o[0]?'selected':''}>${o[1]}</option>`).join('')}</select></label>
+  <div style="grid-column:1/-1" class="row"><button class="btn sm" data-a="mseen" data-id="${m.id}">Подтвердить</button><button class="btn sm ghost" data-a="mdel" data-id="${m.id}">Удалить</button></div></div>`}).join('');
+ return`${head('Моя группа','Локальный список на этом устройстве и быстрая перекличка.','<span class="badge">Локально</span>')}
+ ${onlineCards()}
+ <div class="warnbox">Локальный список: участники из примера (ДЕМО), удалите их и добавьте своих. Данные хранятся только на этом устройстве. Медицинские заметки добавляйте только с согласия участника.</div>
+ <div class="chips">${Object.keys(MODES).map(k=>`<button class="chip ${g.mode===k?'on':''}" data-a="gmode" data-v="${k}">${MODES[k][0]}</button>`).join('')}</div>
+ <div class="card flat small muted">${MODES[g.mode][1]}</div>
+ <label class="f">Название группы<input data-i="group.name" value="${E(g.name)}"></label>
+ <div class="grid g3">${Object.keys(STATUS).map(k=>`<div class="stat"><span><span class="dot ${STATUS[k].c}" style="display:inline-block;margin-right:6px"></span>${STATUS[k].t}</span><b>${cnt[k]}</b></div>`).join('')}</div>
+ ${g.warn?`<div class="dngbox col"><b>Внимание: ${bad.length} участник(а) требуют проверки</b><div class="small">${bad.map(m=>E(m.n)+' — '+STATUS[m.st].t+(m.comm==='none'?', нет связи':'')).join('; ')}</div><div class="grid g2"><button class="btn pri" data-a="rollok">Всё равно все на месте</button><button class="btn" data-a="rollcancel">Отмена, проверю</button></div></div>`:`<button class="btn big pri" data-a="rollcall">${ic('users')} Все участники на месте</button>`}
+ <div class="col">${mem}</div>
+ <div class="card"><div class="sect-t">Добавить участника</div><div class="grid g2"><label class="f">Имя<input id="gmN"></label><label class="f">Уровень<select id="gmL">${LEVELS.map((l,i)=>`<option value="${i}">${l.k}</option>`).join('')}</select></label></div><label class="f">Заметка (по желанию участника)<input id="gmM" placeholder="Например: нужна ингаляция по назначению врача"></label><button class="btn" data-a="gadd">Добавить</button></div>
+ ${lv>=3?leaderPanel():`<div class="card flat"><div class="sect-t">Инструменты руководителя</div><div class="small muted">Журнал происшествий, план эвакуации и сценарий массового происшествия доступны с уровня EXPERT.</div><button class="btn sm" data-a="go" data-v="level">Сменить уровень</button></div>`}`}
+function vGroup(){return S.sync.code?vGroupOnline():vGroupLocal()}
+function onlineCards(){return`<div class="card"><h3>Онлайн-группа</h3><div class="small muted">Участники видят статусы друг друга, руководитель видит позиции и запрашивает отметку «Все на месте». Без связи отчёты копятся на телефоне и уходят позже.</div>${SRV===false?`<div class="warnbox">${MS_CONFIG.demoHost?'В онлайн-демо серверная часть отключена: пользуйтесь локальной группой ниже. В полной версии группы работают через сервер.':'Сервер групп недоступен. Запустите приложение через <span class="mono">npm start</span> и проверьте связь.'}</div>`:''}<div class="grid g2"><div class="col"><b>Создать</b><input id="ogN" placeholder="Название группы" maxlength="40"><input id="ogL" placeholder="Ваше имя" maxlength="40"><button class="btn pri" data-a="gcreate" ${SRV===false?'disabled':''}>Создать группу</button></div><div class="col"><b>Войти по коду</b><input id="ojC" placeholder="Код группы" maxlength="8" style="text-transform:uppercase"><input id="ojN" placeholder="Ваше имя" maxlength="40"><button class="btn" data-a="gjoin" ${SRV===false?'disabled':''}>Войти</button></div></div></div>`}
+function vGroupOnline(){const y=S.sync,d=y.data,isL=y.role==='leader';
+ if(!d)return`${head('Онлайн-группа','Загружаю данные группы…')}${y.error?`<div class="dngbox">${E(y.error)}</div>`:''}<div class="row"><button class="btn" data-a="gpull">Повторить</button><button class="btn ghost" data-a="gleave">Выйти из группы</button></div>`;
+ const cnt={ok:0,help:0,emergency:0,nocomm:0};d.members.forEach(m=>cnt[effStatus(m)]++);
+ const others=d.members.filter(m=>!m.isLeader),ci=d.checkinAt,resp=ci?others.filter(m=>m.ackAt>=ci).length:0,noresp=ci?others.filter(m=>m.ackAt<ci):[];
+ const rows=d.members.map(m=>{const es=effStatus(m),s=STATUS[es],a=ageMs(m),mine=m.id===y.memberId;
+  return`<div class="member"><div><div class="nm">${E(m.name)} ${m.isLeader?'<span class="badge g">руководитель</span>':''} ${mine?'<span class="badge">вы</span>':''}</div><div class="tiny">Отчёт: ${a<60000?'только что':Math.round(a/60000)+' мин назад'}${m.comm==='weak'?' · слабая связь':m.comm==='none'?' · связи нет':''}${m.note?' · '+E(m.note):''}</div>${m.lat!=null?`<div class="tiny mono">${fmtCoord(m.lat,m.lon)}${m.acc?' ±'+m.acc+' м':''}</div>`:''}</div><span class="pill"><span class="dot ${s.c}"></span>${s.t}</span>
+  ${isL&&!mine?`<div style="grid-column:1/-1" class="row">${m.lat!=null?`<button class="btn sm" data-a="copycoords" data-c="${fmtCoord(m.lat,m.lon)}">Скопировать координаты</button>`:''}<button class="btn sm ghost" data-a="gremove" data-id="${m.id}">Удалить</button></div>`:''}</div>`}).join('');
+ return`${head(E(d.name),isL?'Вы руководитель группы.':'Вы участник группы.','<span class="badge live">ОНЛАЙН</span>')}
+ ${y.error?`<div class="dngbox">${E(y.error)}</div>`:''}
+ <div class="card"><div class="sect-t">Код группы</div><div class="row sp"><span class="code">${E(y.code)}</span><button class="btn sm" data-a="gshare">Пригласить</button></div><div class="tiny">Отправьте код участникам. Токен доступа хранится только на этом устройстве.</div></div>
+ <div class="card"><div class="sect-t">Мой статус</div><div class="grid g3s">${['ok','help','emergency'].map(k=>`<button class="btn ${y.myStatus===k?(k==='ok'?'pri':k==='emergency'?'dng':''):''}" style="${y.myStatus===k&&k==='help'?'border-color:var(--warn)':''}" data-a="gstatus" data-v="${k}">${STATUS[k].t}</button>`).join('')}</div>
+  <button class="chk ${y.shareLoc?'on':''}" data-a="gloc" role="checkbox" aria-checked="${!!y.shareLoc}"><span class="bx">✓</span><span>Передавать мою позицию руководителю<small>При статусах «Нужна помощь» и «Emergency» позиция передаётся всегда.</small></span></button>
+  ${y.queue.length?`<div class="warnbox">В очереди ${y.queue.length} отправок: уйдут, когда появится связь.</div>`:''}</div>
+ ${isL?`${d.checkinAt?`<div class="${noresp.length?'warnbox':'risk tone-ok'}">${noresp.length?`<b>Подтвердили ${resp} из ${others.length}.</b> Не ответили: ${noresp.map(m=>E(m.name)).join(', ')}.`:`<div><b>Все ${others.length} участников на месте.</b></div>`}</div>`:''}<button class="btn big pri" data-a="gcheckin">${ic('users')} Все участники на месте?</button><div class="tiny">Участникам придёт запрос «Я на месте». Нажатие подтверждается на сервере.</div>`:''}
+ <div class="grid g3s">${Object.keys(STATUS).map(k=>`<div class="stat"><span>${STATUS[k].t}</span><b>${cnt[k]}</b></div>`).join('')}</div>
+ <div class="col">${rows}</div>
+ ${S.level>=3&&isL?leaderPanel():''}
+ <button class="btn ghost" data-a="gleave">Выйти из группы на этом устройстве</button>`}
+function leaderPanel(){const g=S.group;return`<div class="card"><div class="sect-t">План эвакуации</div><textarea data-i="group.evac" placeholder="Точки эвакуации, маршрут выноса, площадка для приёма помощи, ответственные">${E(g.evac)}</textarea><button class="btn sm" data-a="evactpl">Вставить шаблон</button></div>
+ <div class="card"><div class="row sp"><div class="sect-t">Журнал происшествий</div><button class="btn sm ghost" data-a="logcopy">Скопировать</button></div><div class="grid g2"><label class="f">Тип<select id="lgT">${Object.keys(LOGT).map(k=>`<option value="${k}">${LOGT[k]}</option>`).join('')}</select></label><label class="f">Запись<input id="lgX" placeholder="Что произошло"></label></div><button class="btn" data-a="logadd">Записать</button>
+ ${S.log.length?S.log.slice(0,20).map(x=>`<div class="emnum"><b class="mono" style="font-size:13px;min-width:48px">${tm(x.ts)}</b><span class="badge">${LOGT[x.type]||'Инфо'}</span><span style="flex:1">${E(x.t)}</span></div>`).join(''):'<div class="small muted">Записей пока нет.</div>'}</div>
+ <button class="btn" data-a="go" data-v="memos" >Сценарий массового происшествия: см. Памятки → ЧС</button>`}
+
+/* ================= LEARN ================= */
+let LQ=null;
+function vLearn(){if(LQ)return vLesson();const n=Object.keys(S.learn).length;
+ return`${head('Обучение','9 коротких уроков. После каждого квиз из 3 вопросов.')}
+ <div class="card"><div class="row sp"><b>Пройдено ${n} из ${LESSONS.length}</b><span class="badge g">${Math.round(n/LESSONS.length*100)}%</span></div><div class="bar"><i style="width:${n/LESSONS.length*100}%"></i></div></div>
+ <div class="grid g2">${LESSONS.map((l,i)=>`<button class="tile" data-a="lesson" data-i="${i}"><span class="ti mono" style="font-weight:700">${i+1}</span><b>${E(l.t)}</b><span>${S.learn[i]!==undefined?'Лучший результат: '+S.learn[i]+'%':'Не пройден'}</span></button>`).join('')}</div>`}
+function vLesson(){const L=LESSONS[LQ.i],an=LQ.ans,all=Object.keys(an).length===L.q.length,sc=L.q.filter((q,i)=>an[i]===q.a).length;
+ return`<div class="row"><button class="btn sm ghost" data-a="lclose">← Все уроки</button></div>${head('Урок '+(LQ.i+1)+'. '+L.t)}
+ <ol class="steps">${L.pts.map(p=>`<li>${E(p)}</li>`).join('')}</ol>
+ <div class="sect-t">Квиз</div>
+ ${L.q.map((q,qi)=>`<div class="card"><h3>${E(q.q)}</h3>${q.o.map((o,oi)=>{let c='';if(an[qi]!==undefined){if(oi===q.a)c='right';else if(oi===an[qi])c='wrong'}return`<button class="opt ${c}" data-a="qa" data-q="${qi}" data-o="${oi}" ${an[qi]!==undefined?'disabled':''}>${E(o)}</button>`}).join('')}</div>`).join('')}
+ ${all?`<div class="risk tone-${sc===L.q.length?'ok':'warn'}"><div><b>Результат: ${sc} из ${L.q.length}</b><div class="small muted">${sc===L.q.length?'Отлично. Урок пройден.':'Перечитайте пункты урока и попробуйте ещё раз.'}</div></div></div><div class="grid g2"><button class="btn" data-a="lesson" data-i="${LQ.i}">Пройти заново</button>${LQ.i<LESSONS.length-1?`<button class="btn pri" data-a="lesson" data-i="${LQ.i+1}">Следующий урок</button>`:''}</div>`:''}`}
+
+/* ================= WHAT IF ================= */
+let whatQ='',whatId=null;
+function whatRes(){const q=whatQ.trim().toLowerCase();let hits=[];
+ if(q.length>=2)hits=QUICK.filter(x=>x.q.toLowerCase().includes(q)||x.k.some(k=>q.includes(k)||(q.length>=3&&k.includes(q))));
+ if(whatId&&!q)hits=QUICK.filter(x=>x.id===whatId);
+ if(!hits.length)return q.length>=2?`<div class="card flat"><b>Ничего не найдено.</b><div class="small muted">Попробуйте другие слова или откройте SOS.</div><button class="btn" data-a="go" data-v="sos">Открыть SOS</button></div>`:'';
+ const top=whatId&&hits.find(h=>h.id===whatId)||hits[0],I=INC[top.id];
+ return`${hits.length>1?`<div class="chips">${hits.map(h=>`<button class="chip ${h.id===top.id?'on':''}" data-a="whatpick" data-id="${h.id}">${h.q}</button>`).join('')}</div>`:''}
+ <div class="card"><h2>${I.em} ${top.q}</h2><div class="sect-t">Сейчас</div><ol class="steps">${I.steps.slice(0,7).map(t=>`<li>${E(t)}</li>`).join('')}</ol>${I.call?'<div class="dngbox">Нужна экстренная помощь: <b>112</b>.</div>':''}<div class="grid g2"><button class="btn pri" data-a="stress" data-id="${top.id}">Пошагово (Stress Mode)</button><button class="btn" data-a="incgo" data-id="${top.id}">Полный алгоритм</button></div></div>`}
+function vWhat(){return`${head('Что делать, если…','Введите ситуацию своими словами.')}
+ <input id="whatIn" data-live="what" type="search" placeholder="Например: я потерялся" value="${E(whatQ)}" autocomplete="off" style="font-size:18px;padding:16px">
+ <div class="chips">${QUICK.map(x=>`<button class="chip" data-a="whatchip" data-id="${x.id}" data-q="${E(x.q)}">${x.q}</button>`).join('')}</div>
+ <div id="whatres" class="col">${whatRes()}</div>`}
+
+/* ================= EMERGENCY CARD ================= */
+function cardText(){const c=S.card;return['MS|'+c.name,c.phone,'Contact:'+c.cname,'Group:'+c.group,'Route:'+c.route,'Back:'+c.back,'Status:'+STATUS[c.status].t,'GPS:'+(c.coords||'none')].join('|')}
+function qrSvg(t){try{if(!window.qrcode)return'';if(qrcode.stringToBytesFuncs&&qrcode.stringToBytesFuncs['UTF-8'])qrcode.stringToBytes=qrcode.stringToBytesFuncs['UTF-8'];const q=qrcode(0,'L');q.addData(t);q.make();return q.createSvgTag({cellSize:4,margin:2,scalable:true})}catch(e){return''}}
+function cardRows(){const c=S.card;return[['Имя',c.name],['Экстренный контакт',c.cname+' · '+c.phone],['Группа',c.group],['Маршрут',c.route],['Точка старта',c.start],['Вернуться к',c.back],['Статус',STATUS[c.status].t],['Координаты',c.coords?c.coords+' ('+tm(c.coordsAt)+')':'не сохранены']]}
+function cardPrev(){const q=qrSvg(cardText());return`<div class="rcard"><div class="hd">EMERGENCY CARD · MOUNTAIN SAFE</div>${cardRows().map(r=>`<div class="r"><span>${r[0]}</span><b>${E(r[1])}</b></div>`).join('')}<div class="row sp"><div class="qr">${q||'<div style="font-size:12px;color:#555">QR недоступен без загрузки библиотеки. Покажите текст карточки.</div>'}</div><div style="font-size:12px;color:#555;max-width:200px">QR содержит данные карточки. Сканируется любой камерой.</div></div></div>`}
+function planText(){const c=S.card;return`План похода: ${c.route}\nСтарт: ${c.start}\nВернусь к: ${c.back}\nГруппа: ${c.group}\nКонтакт: ${c.cname} ${c.phone}\nЕсли я не выйду на связь до ${addTime(c.back,1)}, позвоните 112 и сообщите этот маршрут.`}
+function vCard(){const c=S.card,f=(l,p,t='text')=>`<label class="f">${l}<input type="${t}" data-i="card.${p}" data-live="card" value="${E(c[p])}"></label>`;
+ return`${head('Моя Emergency Card','Быстро покажите спасателям, кто вы и куда идёте.')}
+ <div class="warnbox">Поля заполнены примерами: замените их своими данными. Всё хранится только на этом устройстве.</div>
+ <div class="card"><div class="grid g2">${f('Имя','name')}${f('Контакт близкого','cname')}${f('Телефон контакта','phone','tel')}${f('Группа','group')}${f('Маршрут','route')}${f('Точка старта','start')}${f('Планируемое время возвращения','back')}<label class="f">Текущий статус<select data-i="card.status" data-live="card">${Object.keys(STATUS).map(k=>`<option value="${k}" ${c.status===k?'selected':''}>${STATUS[k].t}</option>`).join('')}</select></label></div>
+ <label class="f">Координаты<input id="cardCo" data-i="card.coords" data-live="card" value="${E(c.coords)}" placeholder="43.1234, 77.1234"></label>
+ <div class="small mono" id="gpsline">${gpsLine()}</div>
+ <div class="row"><button class="btn sm pri" data-a="gpsnow">Определить позицию</button><button class="btn sm ${S.tracking?'pri':''}" data-a="track">${S.tracking?'Запись пути: вкл':'Запись пути: выкл'}</button><button class="btn sm" data-a="savecoords">Сохранить введённые координаты</button></div>
+ <div class="tiny">Позиция определяется GPS устройства и сохраняется, чтобы быть доступной без связи. Запись пути расходует батарею.</div></div>
+ <div id="cardprev">${cardPrev()}</div>
+ <div class="grid g2"><button class="btn big pri" data-a="showcard">Показать спасателям</button><button class="btn big" data-a="copyplan">${ic('copy')} План для близких</button></div>`}
+function showCard(){ov(`<div class="in"><div class="row sp"><span class="st-calm">EMERGENCY CARD</span><button class="btn sm" data-a="ovclose">Закрыть</button></div>${cardPrev()}</div>`)}
+
+/* ================= OFFLINE ================= */
+function vOffline(){const c=conn(),cn=CONN[c],p=S.pack,w=PWA;
+ const counts=[['Алгоритмы ЧС',INC_IDS.length],['Памятки',MEMOS.length],['Чек-листы',PREP.length+CHECKSETS.length],['Уроки и квизы',LESSONS.length],['Экстренные номера',EMERGENCY_NUMBERS.length]];
+ const row=(l,v,ok)=>`<div class="emnum"><span style="flex:1">${l}</span><span class="badge ${ok?'g':''}">${v}</span></div>`;
+ return`${head('Офлайн-режим','Спасательные данные должны быть доступны без сети.')}
+ <div class="risk tone-${cn.c}"><span class="dot ${cn.c}" style="width:16px;height:16px"></span><div><b style="font-size:20px">${cn.t}</b><div class="small muted">${c==='offline'?'Интерфейс работает на сохранённых данных.':c==='weak'?'Отправляйте короткие сообщения (SMS), скачайте пакет заранее.':'Проверьте офлайн-готовность до выхода на маршрут.'}</div></div></div>
+ <div class="card"><div class="row sp"><h3>Офлайн-готовность</h3><button class="btn sm" data-a="pwarefresh">Обновить</button></div>
+  ${row('Service Worker',w.sw==='active'?'Активен':w.sw==='installing'?'Устанавливается':'Не активен',w.sw==='active')}
+  ${row('Файлов приложения в кэше',w.cached,w.cached>0)}
+  ${row('Плиток карты в кэше',w.tiles,w.tiles>0)}
+  ${row('Защита хранилища от очистки',w.persisted?'Включена':'Не включена',!!w.persisted)}
+  ${row('Установлено как приложение',isStandalone()?'Да':'Нет',isStandalone())}
+  ${row('Прогноз погоды в памяти',S.wxLive?wxAgeMin()+' мин назад':'Нет',!!S.wxLive)}
+  ${row('Сохранённая позиция',S.gps?agoTxt(S.gps.ts):'Нет',!!S.gps)}
+  <div class="row"><button class="btn pri" data-a="pack">${ic('download')} Подготовить к выходу</button>${w.install?'<button class="btn" data-a="pwainstall">Установить приложение</button>':''}</div>
+  <div class="tiny">${p?'Подготовлено '+tm(p.ts)+'. ':''}Кнопка проверяет кэш, просит браузер защитить хранилище от очистки и обновляет прогноз, если есть связь. Карту сохраняйте на экране «Маршрут».</div></div>
+ <div class="card"><div class="sect-t">Всегда доступно без сети</div><div class="grid g2">${counts.map(x=>`<div class="emnum"><b style="font-size:20px;min-width:34px">${x[1]}</b><span class="small">${x[0]}</span></div>`).join('')}</div></div>
+ <div class="card"><div class="sect-t">Индикатор связи</div><div class="small muted">Режим «Авто» читает состояние сети браузера и тип соединения. Кнопки симулируют состояние для демонстрации.</div><div class="chips">${[['auto','Авто'],['online','ONLINE'],['weak','WEAK'],['offline','OFFLINE']].map(o=>`<button class="chip ${S.sim===o[0]?'on':''}" data-a="sim" data-v="${o[0]}">${o[1]}</button>`).join('')}</div></div>
+ <div class="card flat"><div class="sect-t">Как это работает</div><div class="small muted">Приложение и его данные кэшируются Service Worker при первом открытии, дальше запускаются без сети. Ваши чек-листы, карточка, группа и журнал хранятся в памяти устройства. Карта сохраняется по областям, которые вы просмотрели или сохранили. Для проверки: откройте приложение, отключите интернет, перезагрузите страницу.</div></div>`}
+
+/* ================= DEMO ================= */
+const FX={
+ reset(){setWx('clear');S.sim='online';S.group.members.forEach(m=>{m.st='ok';m.comm='ok';m.seen=Date.now()-60000});S.group.warn=false;S.view='home';curInc=null;ST=null;ov('')},
+ wx1(){setWx('turn');S.view='weather'},
+ weak(){S.sim='weak';S.card.coords='43.2000, 77.0000 (ДЕМО)';S.card.coordsAt=Date.now();S.view='home';toast('Координаты сохранены (демо)')},
+ injury(){const m=S.group.members.find(x=>x.n==='Тимур');if(m){m.st='help';m.seen=Date.now()}logAdd('Тимур упал на осыпи, боль в ноге','injury');S.view='group'},
+ sos(){S.view='sos';curInc='fracture'},
+ stress(){stressStart('fracture',{danger:'no',who:'other',move:'no',comm:'weak',where:S.card.coords})},
+ offline(){S.sim='offline';if(ST){ST.pi=Math.min(ST.plan.length-1,ST.pi+3);drawST()}},
+ card(){ST=null;ov('');S.card.status='help';S.view='card';showCard()}
+};
+function vDemo(){const d=S.demo;
+ return`${head('Демо-сценарий ЧС','Один сквозной пример: погода портится, связь слабеет, участник получает травму.',demoB)}
+ <div class="card"><div class="col">${DEMO_STEPS.map((s,i)=>`<div class="emnum" style="${i===d?'border-color:var(--warn)':''};${i<d?'opacity:.6':''}"><b class="num" style="min-width:28px;color:var(--g)">${i<d?'✓':i+1}</b><div style="flex:1"><b>${E(s.t)}</b><div class="small muted">${E(s.d)}</div></div></div>`).join('')}</div>
+ <div class="grid g2">${d<0?`<button class="btn big pri" data-a="demostart">${ic('play')} Запустить демо</button>`:`<button class="btn big pri" data-a="demonext">${d>=DEMO_STEPS.length-1?'Завершить':'Дальше'}</button><button class="btn big" data-a="demostop">Остановить и сбросить</button>`}</div></div>
+ <div class="tiny">Демо меняет ДЕМО-данные погоды, связи и группы. Реальные данные и GPS не используются.</div>`}
+
+/* ================= ABOUT / MORE ================= */
+function vAbout(){
+ const persons=[['Новичок','Не знает, что взять и как вести себя','Уровень NOVICE: простые шаги, чек-лист, «что нельзя»'],['Обычный турист','Оценить маршрут и погоду','Сложность, время, риск погоды, точки риска'],['Опытный турист','Не читать базу, а проверить','«Я знаю, но хочу проверить», быстрая проверка'],['Руководитель группы','Контроль людей и передача данных','Группа, перекличка, журнал, отчёт для спасателей'],['Семья','Дети рядом, страх потеряться','Режим «Семья», сценарий «потерялся участник»'],['Школьная группа','Ответственность учителя, подсчёт','Режим «Школа», группа 9А, контрольные проверки']];
+ const tech=[['Пошаговый decision flow (по правилам)','Реализовано'],['Stress Mode, Emergency Card, QR','Реализовано'],['PWA: установка, Service Worker, офлайн','Реализовано'],['GPS, запись пути, сохранение позиции','Реализовано'],['Погода: Open-Meteo с кэшем и возрастом данных','Реализовано'],['Карта OpenStreetMap, кэш просмотренных областей','Реализовано'],['Импорт GPX, профиль высоты, набор','Реализовано'],['Онлайн-группы: сервер, коды, отчёты, перекличка','Реализовано'],['Очередь отчётов без связи','Реализовано'],['Демо-сценарий ЧС','ДЕМО: имитация'],['Векторные офлайн-карты, push, казахский язык','План'],['AI-ассистент решений','План: сейчас алгоритмы по правилам'],['Приём Emergency Card спасательными службами','План']];
+ return`${head('О проекте','Mountain Safe: предупредить опасность раньше, чем она станет чрезвычайной ситуацией.')}
+ <div class="card"><div class="sect-t">Кому помогаем</div><div class="grid g2">${persons.map(p=>`<div class="card flat"><h3>${p[0]}</h3><div class="small muted">${p[1]}</div><div class="small">${p[2]}</div></div>`).join('')}</div></div>
+ <div class="card"><div class="sect-t">Ключевые идеи</div><ul class="muted" style="margin:0;padding-left:18px"><li>Stress Mode: один экран, одно действие.</li><li>Адаптация под 4 уровня: меняется содержание, а не только оформление.</li><li>Offline Safety: алгоритмы и карточка работают без связи.</li><li>Emergency Card и сообщение спасателям: точные данные в один экран.</li><li>Group Safety: статусы, перекличка, журнал, план эвакуации.</li></ul></div>
+ <div class="card"><div class="sect-t">Масштабирование</div><ul class="muted" style="margin:0;padding-left:18px"><li>Казахстан: маршруты нацпарков и популярных троп.</li><li>Школы и турклубы: режимы для групп и отчётность.</li><li>Спасательные службы: приём Emergency Card и SITREP.</li><li>Международные маршруты: локальные номера и языки.</li></ul></div>
+ <div class="card"><div class="sect-t">Технологии: что реально сделано</div>${tech.map(t=>`<div class="emnum"><span style="flex:1">${t[0]}</span><span class="badge ${t[1].startsWith('Реал')?'g':'demo'}">${t[1]}</span></div>`).join('')}<div class="tiny">Клиент на чистом JavaScript без сборки, сервер на Node без зависимостей. Переезд на React/Next.js возможен без изменения логики: она вынесена в lib.js и данные.</div></div>
+ <div class="warnbox">Погода: Open-Meteo.com (CC BY 4.0). Карты: © участники OpenStreetMap. Медицинские рекомендации краткие и общие, по мотивам открытых руководств. Перед реальным применением их должен проверить врач или спасательная служба.</div>`}
+function vMore(){return`${head('Разделы')}<div class="grid g2">${NAV.filter(n=>!['home','sos','prep','route'].includes(n[0])).map(n=>`<button class="tile" data-a="go" data-v="${n[0]}"><span class="ti">${ic(n[2])}</span><b>${n[1]}</b></button>`).join('')}</div>`}
+const VIEWS={landing:vLanding,home:vHome,level:vLevel,sos:vSos,prep:vPrep,route:vRoute,weather:vWeather,memos:vMemos,aid:vAid,check:vCheck,group:vGroup,learn:vLearn,what:vWhat,card:vCard,offline:vOffline,demo:vDemo,about:vAbout,more:vMore};
+
+/* ================= ACTIONS ================= */
+const A={
+ go:d=>{if(d.v==='learn')LQ=null;go(d.v)},
+ setlevel:d=>{S.level=+d.v;save();render();toast('Уровень: '+LEVELS[+d.v].k)},
+ inc:d=>{curInc=d.id;render();window.scrollTo({top:0})},
+ incback:()=>{curInc=null;render()},
+ incgo:d=>{S.view='sos';curInc=d.id;render();window.scrollTo({top:0})},
+ dstep:d=>{const o=DONE[d.id]||(DONE[d.id]={});o[d.k]=!o[d.k];render()},
+ stress:d=>stressStart(d.id||null),
+ stpick:d=>{ST.a[d.k]=d.v;ST.q++;if(ST.q>=STK.length){ST.plan=buildPlan(ST.a);ST.phase='plan';ST.pi=0}drawST()},
+ stwhere:d=>{const v=d.v==='0'?'':($('#stWhere').value||'').trim();ST.a.where=v;if(v){S.card.coords=v;S.card.coordsAt=Date.now();save()}ST.plan=buildPlan(ST.a);ST.phase='plan';ST.pi=0;drawST()},
+ stback:()=>{if(ST.q>0)ST.q--;drawST()},
+ stprev:()=>{if(ST.pi>0)ST.pi--;drawST()},
+ stnext:()=>{if(ST.pi<ST.plan.length-1)ST.pi++;drawST()},
+ stclose:()=>{ST=null;ov('');render()},
+ ovclose:()=>{ov('');render()},
+ copysit:()=>copy(sitrep(ST.a)),
+ stcard:()=>{ST=null;S.view='card';showCard();render()},
+ stlog:()=>{logAdd('SOS: '+INC[ST.a.inc||'other'].t+', связь: '+(SA.comm[ST.a.comm]||'?'),'sos');toast('Записано в журнал')},
+ logsos:d=>{logAdd('SOS: '+INC[d.id].t,'sos');toast('Записано в журнал')},
+ sitrep:d=>{const a={inc:d.id,danger:null,who:null,move:null,comm:null,where:S.card.coords||''};ov(`<div class="in"><div class="row sp"><span class="st-calm">СООБЩЕНИЕ СПАСАТЕЛЯМ</span><button class="btn sm" data-a="ovclose">Закрыть</button></div><div class="sit" id="sitTxt">${E(sitrep(a))}</div><button class="btn pri" data-a="copytxt">Скопировать</button><div class="tiny">Чтобы заполнить поля точнее, пройдите Stress Mode.</div></div>`);ST=null;window.__sit=sitrep(a)},
+ copytxt:()=>copy(window.__sit||''),
+ prept:d=>{S.prep[d.id]=!S.prep[d.id];save();render()},
+ prepreset:()=>{S.prep={};save();render()},
+ delpt:d=>{const m={risk:'risks',rest:'rest',exit:'exits'}[d.ty];S.route[m].splice(+d.k,1);save();render()},
+ addpt:()=>{const ty=$('#npT').value,k=parseFloat($('#npK').value),x=($('#npY').value||'').trim();if(!k&&k!==0||!x){toast('Укажите километр и описание');return}const m={risk:'risks',rest:'rest',exit:'exits'}[ty];S.route[m].push({k,t:x,ic:'⚠️'});S.route[m].sort((a,b)=>a.k-b.k);save();render()},
+ wxsc:d=>{if(d.v==='live'){if(S.wxLive){S.wx={sc:'live',...S.wxLive.cur};save();render()}else wxLoad(false)}else{setWx(d.v);render()}},
+ memocat:d=>{memoCat=d.v;render()},
+ qtoggle:d=>{S.quick[d.k]=!S.quick[d.k];save();render()},
+ qreset:()=>{S.quick={};save();render()},
+ ckmode:d=>{checkMode=d.v;render()},
+ cktoggle:d=>{const o=S.checks[d.id]||(S.checks[d.id]={});o[d.k]=!o[d.k];save();render()},
+ ckreset:d=>{S.checks[d.id]={};save();render()},
+ gmode:d=>{S.group.mode=d.v;save();render()},
+ mstat:(d,el)=>{const m=S.group.members.find(x=>x.id==d.id);m.st=el.value;save();render()},
+ mcomm:(d,el)=>{const m=S.group.members.find(x=>x.id==d.id);m.comm=el.value;if(el.value==='none'&&m.st==='ok')m.st='nocomm';save();render()},
+ mseen:d=>{const m=S.group.members.find(x=>x.id==d.id);m.seen=Date.now();save();render();toast(m.n+': подтверждён')},
+ mdel:d=>{S.group.members=S.group.members.filter(x=>x.id!=d.id);save();render()},
+ gadd:()=>{const n=($('#gmN').value||'').trim();if(!n){toast('Введите имя');return}S.group.members.push({id:S.group.nextId++,n,lv:+$('#gmL').value,st:'ok',comm:'ok',seen:Date.now(),med:($('#gmM').value||'').trim()});save();render()},
+ rollcall:()=>{const bad=S.group.members.some(m=>m.st==='nocomm'||m.st==='emergency'||m.comm==='none');if(bad){S.group.warn=true;render();return}A.rollok()},
+ rollok:()=>{const g=S.group;g.warn=false;g.members.forEach(m=>{m.seen=Date.now();if(m.st==='nocomm')m.st='ok'});logAdd('Перекличка: '+g.members.length+' из '+g.members.length+' на месте','info');save();render();toast('Перекличка: '+g.members.length+' из '+g.members.length+' на месте')},
+ rollcancel:()=>{S.group.warn=false;render()},
+ evactpl:()=>{S.group.evac='Точки эвакуации: \nМаршрут выноса: \nПлощадка для приёма помощи: \nОтветственный за пострадавшего: \nОтветственный за группу: \nОтветственный за связь: \nКонтрольные времена связи: ';save();render()},
+ logadd:()=>{const x=($('#lgX').value||'').trim();if(!x){toast('Введите запись');return}logAdd(x,$('#lgT').value);render()},
+ logcopy:()=>copy(S.log.slice().reverse().map(x=>tm(x.ts)+' ['+(LOGT[x.type]||'Инфо')+'] '+x.t).join('\n')||'Журнал пуст'),
+ lesson:d=>{LQ={i:+d.i,ans:{}};render();window.scrollTo({top:0})},
+ lclose:()=>{LQ=null;render()},
+ qa:d=>{LQ.ans[d.q]=+d.o;const L=LESSONS[LQ.i];if(Object.keys(LQ.ans).length===L.q.length){const sc=L.q.filter((q,i)=>LQ.ans[i]===q.a).length,p=Math.round(sc/L.q.length*100);S.learn[LQ.i]=Math.max(S.learn[LQ.i]||0,p);save()}render()},
+ whatpick:d=>{whatId=d.id;whatQ=whatQ||'';$('#whatres').innerHTML=whatRes()},
+ whatchip:d=>{whatQ=d.q;whatId=d.id;render();window.scrollTo({top:0})},
+ savecoords:()=>{const v=($('#cardCo').value||'').trim();if(!v){toast('Введите координаты');return}S.card.coords=v;S.card.coordsAt=Date.now();save();render();toast('Координаты сохранены')},
+ showcard:()=>showCard(),
+ copyplan:()=>copy(planText()),
+ sim:d=>{S.sim=d.v;save();render()},
+ pack:async()=>{await pwaRefresh();try{if(navigator.storage&&navigator.storage.persist)await navigator.storage.persist()}catch(e){}await pwaRefresh();if(PWA.cached>0){S.pack={ts:Date.now()};S.prep.pack=1;save();toast('Готово: приложение в кэше ('+PWA.cached+' файлов)')}else toast('Service Worker недоступен: откройте приложение по http(s) и перезагрузите');wxLoad(true);render()},
+ demostart:()=>{window.__wxPrev=JSON.stringify(S.wx);S.demo=0;FX.reset();render();window.scrollTo({top:0})},
+ demonext:()=>{if(S.demo>=DEMO_STEPS.length-1){A.demostop();return}S.demo++;FX[DEMO_STEPS[S.demo].fx]();render();window.scrollTo({top:0})},
+ demostop:()=>{S.demo=-1;S.sim='auto';ST=null;ov('');try{const p=JSON.parse(window.__wxPrev||'null');if(p&&p.sc==='live')S.wx=p;else setWx('clear')}catch(e){setWx('clear')}S.view='demo';render()},
+ scrollto:d=>{const el=document.getElementById(d.id);if(el)el.scrollIntoView({behavior:'smooth',block:'start'})},
+ enterlvl:d=>{S.level=+d.v;save();go('home')},
+ gpsnow:async()=>{toast('Определяю позицию…');const p=await gpsOnce();if(p){toast('Позиция сохранена ±'+p.acc+' м');if(S.view==='route'&&MAP)MAP.setView([p.lat,p.lon],Math.max(MAP.getZoom(),14));if(S.view==='card')render()}},
+ stgps:async()=>{const p=await gpsOnce();if(p){ST.a.where=S.card.coords;drawST()}},
+ track:()=>{S.tracking=!S.tracking;if(S.tracking){gpsStart();toast('Запись пути включена')}else{gpsStop();toast('Запись пути выключена')}save();render()},
+ wxload:()=>wxLoad(false),
+ wxgps:async()=>{const p=await gpsOnce();if(p)wxLoad(false)},
+ routedemo:()=>{const d=DEF().route;S.route=d;save();render()},
+ addmode:d=>{S.addMode=d.v;save();render()},
+ cachemap:()=>mapCacheView(),
+ pwaupdate:()=>{if(PWA.waiting)PWA.waiting.postMessage('SKIP_WAITING')},
+ pwarefresh:()=>pwaRefresh(),
+ pwainstall:async()=>{if(!PWA.install)return;PWA.install.prompt();try{await PWA.install.userChoice}catch(e){}PWA.install=null;render()},
+ gcreate:async()=>{const n=($('#ogN').value||'').trim(),l=($('#ogL').value||'').trim();if(!n||!l){toast('Введите название группы и своё имя');return}try{await gCreate(n,l,S.group.mode);render();toast('Группа создана')}catch(e){toast('Не удалось создать: '+e.message)}},
+ gjoin:async()=>{const c=($('#ojC').value||'').trim(),n=($('#ojN').value||'').trim();if(!c||!n){toast('Введите код и своё имя');return}try{await gJoin(c,n);render();toast('Вы в группе')}catch(e){toast(e.message)}},
+ gleave:()=>gLeave(),
+ gpull:()=>gPull(),
+ gstatus:d=>gSetStatus(d.v),
+ gloc:()=>{S.sync.shareLoc=!S.sync.shareLoc;save();if(S.sync.shareLoc)gpsOnce().finally(()=>gReport());render()},
+ gcheckin:()=>gCheckin(),
+ gack:async()=>{const y=S.sync;if(y.data)y.ackedAt=y.data.checkinAt;save();await gReport({ack:true});renderShell();if(S.view==='group')render();toast('Отмечено: вы на месте')},
+ gremove:d=>gRemove(+d.id),
+ gshare:()=>shareText('Присоединяйтесь к группе «'+S.sync.data.name+'» в Mountain Safe. Код группы: '+S.sync.code+'. Раздел «Моя группа» → «Войти по коду».'),
+ copycoords:d=>copy(d.c),
+ stgroup:async()=>{S.sync.myStatus='emergency';await gpsOnce();await gReport({note:INC[ST.a.inc||'other'].t});toast('Группа оповещена')},
+ sharesit:()=>shareText(sitrep(ST.a)),
+};
+/* keyboard support for non-button clickable rows */
+document.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&e.target.matches&&e.target.matches('li[data-a]')){e.preventDefault();e.target.click()}});
+document.addEventListener('click',e=>{const el=e.target.closest('[data-a]');if(!el||el.disabled)return;const f=A[el.dataset.a];if(f){e.preventDefault();f(el.dataset,el)}});
+document.addEventListener('input',e=>{const el=e.target;if(el.dataset&&el.dataset.i&&!el.dataset.a){let v=el.value;if(el.dataset.n!==undefined)v=parseFloat(v)||0;setPath(el.dataset.i,v)}if(el.dataset&&el.dataset.live&&LIVE[el.dataset.live])LIVE[el.dataset.live](el)});
+document.addEventListener('change',e=>{const el=e.target;if(el.id==='gpxIn'){gpxImport(el.files&&el.files[0]);el.value='';return}if(!el.dataset)return;if(el.dataset.r!==undefined)render();if(el.dataset.sel&&A[el.dataset.sel])A[el.dataset.sel](el.dataset,el)});
+window.addEventListener('online',()=>render());window.addEventListener('offline',()=>render());
+try{if(navigator.connection)navigator.connection.addEventListener('change',()=>render())}catch(e){}
+boot();
+render();
+
+
+// ===== FILE: public/sw.js =====
+/* Mountain Safe service worker: офлайн-первый для оболочки приложения, кэш карт по мере просмотра. */
+const VERSION='ms-56d0fb9352';
+const TILE_CACHE='ms-tiles-v1';
+const TILE_HOST='tile.openstreetmap.org';
+const TILE_LIMIT=800;
+const SHELL=["./","css/styles.css","fonts/jetbrains-mono-latin-500-normal.woff2","fonts/jetbrains-mono-latin-700-normal.woff2","fonts/onest-cyrillic-400-normal.woff2","fonts/onest-cyrillic-600-normal.woff2","fonts/onest-cyrillic-700-normal.woff2","fonts/onest-cyrillic-800-normal.woff2","fonts/onest-latin-400-normal.woff2","fonts/onest-latin-600-normal.woff2","fonts/onest-latin-700-normal.woff2","fonts/onest-latin-800-normal.woff2","fonts/unbounded-cyrillic-700-normal.woff2","fonts/unbounded-latin-700-normal.woff2","icons/apple-touch-icon.png","icons/icon-192.png","icons/icon-512.png","icons/maskable-512.png","index.html","js/config.js","js/core.js","js/data.js","js/landing.js","js/lib.js","js/services.js","js/views.js","manifest.webmanifest","vendor/leaflet/images/layers-2x.png","vendor/leaflet/images/layers.png","vendor/leaflet/images/marker-icon-2x.png","vendor/leaflet/images/marker-icon.png","vendor/leaflet/images/marker-shadow.png","vendor/leaflet/leaflet.css","vendor/leaflet/leaflet.js","vendor/qrcode.js"];
+
+self.addEventListener('install',e=>{
+  e.waitUntil(caches.open(VERSION).then(c=>c.addAll(SHELL)));
+});
+self.addEventListener('activate',e=>{
+  e.waitUntil((async()=>{
+    for(const k of await caches.keys())if(k!==VERSION&&k!==TILE_CACHE)await caches.delete(k);
+    await self.clients.claim();
+  })());
+});
+self.addEventListener('message',e=>{if(e.data==='SKIP_WAITING')self.skipWaiting()});
+
+async function trim(name,max){const c=await caches.open(name),ks=await c.keys();for(let i=0;i<ks.length-max;i++)await c.delete(ks[i])}
+
+self.addEventListener('fetch',e=>{
+  const req=e.request,url=new URL(req.url);
+  if(req.method!=='GET')return;
+  if(url.hostname===TILE_HOST){
+    e.respondWith((async()=>{
+      const c=await caches.open(TILE_CACHE),hit=await c.match(req);
+      if(hit)return hit;
+      try{const r=await fetch(req);if(r.ok){c.put(req,r.clone());trim(TILE_CACHE,TILE_LIMIT)}return r}
+      catch(err){return new Response('',{status:504})}
+    })());return;
+  }
+  if(url.origin!==location.origin||url.pathname.startsWith('/api/'))return;
+  /* оболочка: сначала кэш, параллельно обновляем */
+  e.respondWith((async()=>{
+    const c=await caches.open(VERSION);
+    const key=req.mode==='navigate'?'./':req;
+    const hit=await c.match(key,{ignoreSearch:true});
+    const net=fetch(req).then(r=>{if(r.ok)c.put(req.mode==='navigate'?'./':req,r.clone());return r}).catch(()=>null);
+    if(hit){e.waitUntil(net);return hit}
+    return (await net)||new Response('Офлайн',{status:503,headers:{'Content-Type':'text/plain; charset=utf-8'}});
+  })());
+});
+
+
+// ===== FILE: test/logic.test.js =====
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict');
+const L=require('../public/js/lib.js');
+
+test('wxRisk: уровни риска',()=>{
+  assert.equal(L.wxRisk({temp:16,wind:12,rain:0,storm:5,vis:30}).l,0);
+  assert.equal(L.wxRisk({temp:8,wind:28,rain:1,storm:35,vis:8}).l,2);
+  assert.equal(L.wxRisk({temp:3,wind:55,rain:8,storm:80,vis:.8}).l,3);
+});
+test('routeCalc: время и сложность растут с набором',()=>{
+  const a=L.routeCalc({dist:5,up:100,max:1500}),b=L.routeCalc({dist:12,up:850,max:2650});
+  assert.ok(b.h>a.h);assert.ok(b.d>a.d);
+});
+test('addTime: переход через полночь и формат',()=>{
+  assert.equal(L.addTime('08:00',3.5),'11:30');
+  assert.equal(L.addTime('23:30',1),'00:30');
+});
+test('parseCoord: разные форматы и невалидные значения',()=>{
+  assert.deepEqual(L.parseCoord('43.2, 77.1'),{lat:43.2,lon:77.1});
+  assert.deepEqual(L.parseCoord('43,2 77,1'),{lat:43.2,lon:77.1});
+  assert.equal(L.parseCoord('123, 77'),null);
+  assert.equal(L.parseCoord('нет'),null);
+});
+test('haversine: ~111 км на градус широты',()=>{
+  const d=L.haversine([43,77],[44,77]);assert.ok(Math.abs(d-111195)<300);
+});
+const GPX=`<?xml version="1.0"?><gpx><trk><name>Тест &amp; трек</name><trkseg>
+${Array.from({length:40},(_,i)=>`<trkpt lat="${43+i*0.001}" lon="77"><ele>${1000+i*10}</ele></trkpt>`).join('\n')}
+</trkseg></trk></gpx>`;
+test('parseGpx + trackStats: дистанция, набор, профиль',()=>{
+  const g=L.parseGpx(GPX);assert.equal(g.name,'Тест & трек');assert.equal(g.pts.length,40);
+  const s=L.trackStats(g.pts);
+  assert.ok(s.dist>4&&s.dist<4.6,'dist '+s.dist);
+  assert.ok(s.up>330&&s.up<400,'up '+s.up);
+  assert.equal(s.down,0);assert.ok(s.max>1350);assert.ok(s.profile.length>1);
+});
+test('parseGpx: отбрасывает мусорные точки',()=>{
+  const g=L.parseGpx('<gpx><trkpt lat="999" lon="0"/><trkpt lat="10" lon="20"/></gpx>');assert.equal(g.pts.length,1);
+});
+test('nearestKm: находит ближайший километр вдоль трека',()=>{
+  const g=L.parseGpx(GPX),n=L.nearestKm(g.pts,43.02,77.0);assert.ok(n.km>2&&n.km<2.4);assert.ok(n.off<50);
+});
+test('openMeteoToWx: преобразование ответа API',()=>{
+  const j={elevation:1800,current:{temperature_2m:7.4,precipitation:.2,wind_speed_10m:31.6,weather_code:95},
+    hourly:{time:['2026-09-26T14:00','2026-09-26T15:00'],temperature_2m:[7,6],precipitation:[.2,1],wind_speed_10m:[31,35],visibility:[8000,3000],weather_code:[95,95],cape:[1200,900]}};
+  const w=L.openMeteoToWx(j);
+  assert.equal(w.cur.temp,7);assert.equal(w.cur.wind,32);assert.equal(w.cur.storm,85);
+  assert.equal(w.hourly[0].h,14);assert.equal(w.hourly[1].w.vis,3);
+});
+
+
+// ===== FILE: test/api.test.js =====
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict');
+const path=require('path'),os=require('os'),fs=require('fs');
+process.env.DATA_FILE=path.join(fs.mkdtempSync(path.join(os.tmpdir(),'ms-')),'g.json');
+const {server}=require('../server.js');
+let base;
+test.before(async()=>{await new Promise(r=>server.listen(0,'127.0.0.1',r));base='http://127.0.0.1:'+server.address().port});
+test.after(()=>server.close());
+const j=async(p,o={})=>{const r=await fetch(base+p,{...o,headers:{'Content-Type':'application/json',...(o.headers||{})}});let b=null;try{b=await r.json()}catch(e){}return{s:r.status,b}};
+const auth=t=>({Authorization:'Bearer '+t});
+
+test('здоровье и статика',async()=>{
+  assert.equal((await j('/api/health')).s,200);
+  const r=await fetch(base+'/');assert.equal(r.status,200);assert.match(await r.text(),/Mountain Safe/);
+  assert.equal((await fetch(base+'/sw.js')).headers.get('service-worker-allowed'),'/');
+  assert.equal((await fetch(base+'/../server.js')).status,404);
+});
+test('полный сценарий группы: создание, вход, отчёты, перекличка, права',async()=>{
+  const c=await j('/api/groups',{method:'POST',body:JSON.stringify({name:'Поход 9А',leaderName:'Учитель',mode:'school'})});
+  assert.equal(c.s,201);assert.match(c.b.code,/^[A-Z2-9]{6}$/);
+  const {code,leaderToken}=c.b;
+  const jn=await j(`/api/groups/${code}/join`,{method:'POST',body:JSON.stringify({name:'Айгерим',level:0})});
+  assert.equal(jn.s,201);const mt=jn.b.memberToken,mid=jn.b.memberId;
+
+  // без токена нельзя
+  assert.equal((await j(`/api/groups/${code}`)).s,401);
+  // отчёт участника (пакет из офлайн-очереди) с позицией
+  const rp=await j(`/api/groups/${code}/report`,{method:'POST',headers:auth(mt),body:JSON.stringify({reports:[{status:'ok',lat:43.2,lon:77.1,acc:12,ts:Date.now()-60000},{status:'emergency',comm:'weak',lat:43.21,lon:77.11,acc:9,note:'Падение',ts:Date.now()}]})});
+  assert.equal(rp.s,200);
+  // руководитель видит координаты и статус
+  const lv=await j(`/api/groups/${code}`,{headers:auth(leaderToken)});
+  const m=lv.b.members.find(x=>x.id===mid);
+  assert.equal(m.status,'emergency');assert.equal(m.lat,43.21);assert.equal(m.note,'Падение');assert.equal(lv.b.leader,true);
+  // участник не видит чужие координаты
+  const mv=await j(`/api/groups/${code}`,{headers:auth(mt)});
+  assert.equal(mv.b.members.find(x=>x.isLeader).lat,null);assert.equal(mv.b.leader,false);
+  // перекличка: только руководитель
+  assert.equal((await j(`/api/groups/${code}/checkin`,{method:'POST',headers:auth(mt),body:'{}'})).s,403);
+  const ci=await j(`/api/groups/${code}/checkin`,{method:'POST',headers:auth(leaderToken),body:'{}'});assert.equal(ci.s,200);
+  await j(`/api/groups/${code}/report`,{method:'POST',headers:auth(mt),body:JSON.stringify({ack:true,status:'ok'})});
+  const after=await j(`/api/groups/${code}`,{headers:auth(leaderToken)});
+  const mm=after.b.members.find(x=>x.id===mid);assert.ok(mm.ackAt>=after.b.checkinAt);
+  // удалить участника может только руководитель, руководителя удалить нельзя
+  assert.equal((await j(`/api/groups/${code}/remove`,{method:'POST',headers:auth(mt),body:JSON.stringify({memberId:1})})).s,403);
+  assert.equal((await j(`/api/groups/${code}/remove`,{method:'POST',headers:auth(leaderToken),body:JSON.stringify({memberId:1})})).s,400);
+  assert.equal((await j(`/api/groups/${code}/remove`,{method:'POST',headers:auth(leaderToken),body:JSON.stringify({memberId:mid})})).s,200);
+  assert.equal((await j(`/api/groups/${code}`,{headers:auth(mt)})).s,401);
+});
+test('валидация и защита',async()=>{
+  assert.equal((await j('/api/groups',{method:'POST',body:JSON.stringify({name:'',leaderName:''})})).s,400);
+  assert.equal((await j('/api/groups',{method:'POST',body:'{bad'})).s,400);
+  assert.equal((await j('/api/groups/ZZZZZZ')).s,404);
+  const c=await j('/api/groups',{method:'POST',body:JSON.stringify({name:'<b>x</b>',leaderName:'Я'})});
+  assert.equal(c.b&&c.s,201);
+  const g=await j(`/api/groups/${c.b.code}`,{headers:auth(c.b.leaderToken)});assert.ok(!g.b.name.includes('<'));
+  // мусорные значения не портят состояние
+  await j(`/api/groups/${c.b.code}/report`,{method:'POST',headers:auth(c.b.leaderToken),body:JSON.stringify({status:'hack',lat:999,lon:'x'})});
+  const g2=await j(`/api/groups/${c.b.code}`,{headers:auth(c.b.leaderToken)});
+  assert.equal(g2.b.members[0].status,'ok');assert.ok(g2.b.members[0].lat==null);
+  const big=await j('/api/groups',{method:'POST',body:JSON.stringify({name:'x'.repeat(20000),leaderName:'a'})});assert.equal(big.s,413);
+});
+
+
+// ===== FILE: Dockerfile =====
+FROM node:22-alpine
+WORKDIR /app
+COPY package.json server.js ./
+COPY scripts ./scripts
+COPY public ./public
+RUN node scripts/gen-sw.js && mkdir -p data && chown -R node:node /app
+ENV NODE_ENV=production PORT=3000 DATA_FILE=/app/data/groups.json
+USER node
+EXPOSE 3000
+VOLUME ["/app/data"]
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:3000/api/health || exit 1
+CMD ["node","server.js"]
+
+
+// ===== FILE: .dockerignore =====
+node_modules
+data
+.git
+test
+*.md
+
+
+// ===== FILE: .gitignore =====
+node_modules/
+data/
+*.log
+.DS_Store
+
+
+// ===== FILE: README.md =====
+# Mountain Safe — безопасность в горах
+
+PWA-помощник для походов: SOS и Stress Mode с пошаговыми алгоритмами, Emergency Card с QR, подготовка и оценка риска, маршрут и карта, погода, онлайн-группы с перекличкой. Работает без интернета после первого открытия.
+
+> Mountain Safe помогает принять решение и не заменяет профессиональную медицинскую или спасательную помощь. Тексты первой помощи краткие и общие; **перед реальным применением их обязан проверить врач или спасательная служба** (см. «Безопасность и ограничения»).
+
+## Быстрый старт
+
+Нужен Node.js 18+. Зависимостей нет.
+
+```bash
+npm start          # http://localhost:3000
+npm test           # юнит-тесты логики и API (12 тестов)
+```
+
+GPS и Service Worker работают только на `https://` или `http://localhost`. Для телефона выложите проект на HTTPS-хостинг (см. «Развёртывание»).
+
+## Что реально работает
+
+| Возможность | Как реализовано |
+|---|---|
+| Офлайн | Service Worker кэширует всё приложение, шрифты и библиотеки; данные пользователя хранятся в `localStorage`. Страница открывается без сети после первого визита |
+| GPS | `navigator.geolocation`: разовая позиция, запись пути (след), последняя позиция сохраняется для офлайна |
+| Погода | Open-Meteo API (без ключа), кэш на устройстве, пометка возраста данных, при отсутствии данных ДЕМО-сценарии с явной маркировкой |
+| Карта | Leaflet + OpenStreetMap, кэш просмотренных областей, сохранение видимой области (до 60 плиток) |
+| Маршрут | Импорт GPX: дистанция, набор/сброс высоты, профиль, точки риска/отдыха/выхода касанием карты |
+| Онлайн-группы | Сервер `server.js`: код группы, вход по коду, статусы, позиции для руководителя, запрос «Все на месте» с подтверждением, очередь отчётов без связи |
+| Stress Mode, SOS, Emergency Card | 12 сценариев ЧС, план собирается по ответам, SMS и «Поделиться», QR карточки |
+| Уровни | NOVICE / AVERAGE / ADVANCED / EXPERT меняют чек-листы, памятки, шаги SOS, инструменты руководителя |
+
+Что остаётся ДЕМО: сценарная погода (когда нет реальных данных), пример участников локальной группы, «Демо-сценарий ЧС».
+
+## Структура
+
+```
+server.js            Node-сервер: статика + API групп (без зависимостей)
+public/
+  index.html         оболочка
+  sw.js              Service Worker (генерируется: npm run build)
+  manifest.webmanifest
+  js/lib.js          чистая логика (риск, GPX, координаты, Open-Meteo), тестируется в Node
+  js/data.js         контент: сценарии ЧС, памятки, чек-листы, уроки
+  js/core.js         состояние, оболочка, SOS, Stress Mode
+  js/services.js     GPS, погода, карта, PWA, клиент групп
+  js/views.js        экраны и обработчики действий
+scripts/gen-sw.js    пересобирает список кэша и версию SW
+test/                node:test: логика и API
+```
+
+После любых правок в `public/` выполните `npm run build` (или просто `npm start`/`npm test`): обновится версия кэша, и пользователи получат баннер «Доступна новая версия».
+
+## API групп
+
+Все ответы JSON. Токен передаётся как `Authorization: Bearer <токен>`.
+
+| Метод и путь | Кто | Описание |
+|---|---|---|
+| `POST /api/groups` | любой | `{name, leaderName, mode}` → `{code, leaderToken, memberId, memberToken}` |
+| `POST /api/groups/:code/join` | любой с кодом | `{name, level}` → `{memberId, memberToken}` |
+| `GET /api/groups/:code` | участник/руководитель | состав и статусы; координаты видит только руководитель (и участник свои) |
+| `POST /api/groups/:code/report` | участник | `{status, comm, lat, lon, acc, note, ts, ack}` или `{reports:[…]}` (пакет из офлайн-очереди) |
+| `POST /api/groups/:code/checkin` | руководитель | запрос отметки «Я на месте» |
+| `POST /api/groups/:code/remove` | руководитель | `{memberId}` |
+| `DELETE /api/groups/:code` | руководитель | удалить группу |
+| `GET /api/health` | любой | проверка |
+
+Хранение: JSON-файл (`DATA_FILE`, по умолчанию `data/groups.json`), группы удаляются через 7 дней без активности. Лимиты: тело до 16 КБ, 240 запросов/мин на IP, 60 участников в группе.
+
+Приватность: позиция участника передаётся руководителю только если участник включил опцию, либо при статусах «Нужна помощь»/«Emergency». Персональные данные ограничены именем; регистрации нет.
+
+## Развёртывание
+
+**Docker**
+```bash
+docker build -t mountain-safe .
+docker run -p 3000:3000 -v ms-data:/app/data mountain-safe
+```
+
+**Любой Node-хостинг** (Render, Railway, Fly.io, VPS): команда запуска `node server.js`, переменная `PORT`, том для `DATA_FILE`. Поставьте перед сервером HTTPS (обязательно для GPS и PWA).
+
+Переменные: `PORT`, `DATA_FILE`, `CORS_ORIGIN` (если клиент на другом домене).
+
+## Безопасность и ограничения
+
+- **Медицинский контент.** Тексты в `public/js/data.js` составлены по мотивам открытых руководств (Красный Крест, Wilderness Medical Society) и намеренно консервативны. Перед публикацией их должен проверить врач или сертифицированный инструктор по первой помощи, а локальные номера служб и протоколы (Казахстан) сверить со спасательной службой.
+- **Погода.** Open-Meteo даёт модельный прогноз для точки на высоте сетки, а «вероятность грозы» здесь оценка по коду погоды и CAPE. Это подсказка, не замена официальному прогнозу.
+- **Карты.** Публичный сервер OSM не предназначен для массового скачивания: приложение кэширует только просмотренные области и не более 60 плиток за раз. Для реального масштаба подключите свой тайл-сервер или коммерческого провайдера, для полноценных офлайн-карт — векторные тайлы (PMTiles).
+- **Онлайн-группы** не заменяют спасателей и зависят от связи; при её отсутствии данные копятся на телефоне. Статус участника без отчётов более 10 минут показывается как «Нет связи».
+- **Сервер минимален**: нет аккаунтов, токены хранятся в открытом виде в JSON, нет шифрования на диске. Для массового использования нужны база данных, HTTPS-терминация, наблюдаемость и юридическая проверка обработки персональных данных.
+
+## Лицензии данных и библиотек
+
+Open-Meteo.com (CC BY 4.0, бесплатно для некоммерческого использования; для коммерции нужен план). © участники OpenStreetMap (ODbL). Leaflet (BSD-2). qrcode-generator (MIT). Шрифты Onest, Unbounded, JetBrains Mono (SIL OFL) через Fontsource.
+
+## Дорожная карта
+
+Казахский и английский языки; векторные офлайн-карты; push-уведомления руководителю; приём Emergency Card спасательными службами; голосовой Stress Mode; ассистент решений на основе ИИ поверх проверенных протоколов; миграция клиента на React/Next.js/TypeScript (логика уже отделена в `lib.js` и `data.js`).
+
+## Сценарий демо для жюри (3 минуты)
+
+1. Главная → «Подготовка»: отметить чек-лист, показать готовность и умные предупреждения.
+2. «Маршрут»: импорт GPX, карта, точки риска; «Погода»: реальный прогноз и уровень риска.
+3. «Моя группа»: создать онлайн-группу; на втором телефоне войти по коду; участник нажимает «Emergency», у руководителя всплывает тревога и позиция.
+4. «Офлайн-режим»: выключить интернет, перезагрузить страницу, открыть SOS → «Подозрение на перелом» → Stress Mode → сообщение спасателям → Emergency Card с QR.
+5. Показать, как отчёт участника без связи уходит после возвращения сети.
