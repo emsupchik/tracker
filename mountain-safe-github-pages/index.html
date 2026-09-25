@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Mountain Safe</title>
+<meta name="description" content="Безопасность в горах: SOS, Stress Mode, офлайн, группа, Emergency Card.">
+<meta name="theme-color" content="#0f1416">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="css/styles.css">
+<style>html{padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}body{margin:0}[hidden]{display:none!important}</style>
+</head>
+<body>
+
+
+<div class="app" id="app">
+  <aside class="side" id="side"></aside>
+  <div class="main">
+    <header class="top" id="top"></header>
+    <div id="banner"></div>
+    <main id="view" class="view" tabindex="-1"></main>
+    <p class="disc">Mountain Safe помогает принять решение и не заменяет профессиональную медицинскую или спасательную помощь. При угрозе жизни звоните в экстренные службы.</p>
+  </div>
+</div>
+<nav class="tabbar" id="tabbar" aria-label="Основная навигация"></nav>
+<div id="demobar"></div>
+<div id="updatebar"></div>
+<div id="overlay"></div>
+<div id="toast"></div>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script src="vendor/qrcode.js"></script>
+<script src="js/config.js"></script>
+<script src="js/data.js"></script>
+<script src="js/lib.js"></script>
+<script src="js/core.js"></script>
+<script src="js/services.js"></script>
+<script src="js/landing.js"></script>
+<script src="js/views.js"></script>
+</body>
+</html>
